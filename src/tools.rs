@@ -2559,7 +2559,7 @@ impl Tool for SubagentResult {
         ToolSchema {
             name: "subagent_result".into(),
             description: "Return bounded subagent results; optionally apply or discard a reviewed worktree diff.".into(),
-            parameters: json!({"type":"object","properties":{"agent_id":{"type":"string"},"apply":{"type":"boolean"},"discard":{"type":"boolean"}},"required":["agent_id"]}),
+            parameters: json!({"type":"object","properties":{"agent_id":{"type":"string"},"worktree_id":{"type":"string"},"apply":{"type":"boolean"},"discard":{"type":"boolean"}},"required":[]}),
         }
     }
 
@@ -2568,7 +2568,17 @@ impl Tool for SubagentResult {
     }
 
     async fn call(&self, mut context: ToolContext<'_>, arguments: Value) -> Result<ToolResult> {
-        let agent_id = subagent_id(&arguments)?.to_owned();
+        let agent_id = arguments
+            .get("agent_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let worktree_id = arguments
+            .get("worktree_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if agent_id.is_none() && worktree_id.is_none() {
+            anyhow::bail!("subagent_result requires agent_id or worktree_id");
+        }
         let apply = arguments
             .get("apply")
             .and_then(Value::as_bool)
@@ -2603,20 +2613,45 @@ impl Tool for SubagentResult {
                 .session
                 .as_deref_mut()
                 .context("worktree decisions require a session")?;
-            let snapshot = if apply {
-                self.manager.merge(&agent_id, session).await?
-            } else {
-                self.manager.discard(&agent_id, session).await?
-            };
-            session.record_subagent_lifecycle(
-                snapshot.agent_id.clone(),
-                crate::sessions::LifecycleState {
-                    state: snapshot.status.clone(),
-                    detail: Some(snapshot.summary.clone()),
-                },
-            )?;
+            if let Some(agent_id) = agent_id {
+                let snapshot = if apply {
+                    self.manager.merge(&agent_id, session).await?
+                } else {
+                    self.manager.discard(&agent_id, session).await?
+                };
+                session.record_subagent_lifecycle(
+                    snapshot.agent_id.clone(),
+                    crate::sessions::LifecycleState {
+                        state: snapshot.status.clone(),
+                        detail: Some(snapshot.summary.clone()),
+                    },
+                )?;
+                return Ok(ToolResult::complete(
+                    serde_json::to_string(&snapshot)?,
+                    false,
+                ));
+            }
+            let worktree_id = worktree_id.context("missing recovered worktree id")?;
+            let info = WorktreeManager::recover(session, &worktree_id)?;
+            let manager = WorktreeManager::new(context.guard.root().to_path_buf())?;
+            if apply {
+                let review = manager.apply_review(&info, session).await?;
+                manager.discard(&info, session).await?;
+                return Ok(ToolResult::complete(
+                    serde_json::to_string(&json!({
+                        "worktree_id": worktree_id,
+                        "status": "merged",
+                        "review": review,
+                    }))?,
+                    false,
+                ));
+            }
+            manager.discard(&info, session).await?;
             return Ok(ToolResult::complete(
-                serde_json::to_string(&snapshot)?,
+                serde_json::to_string(&json!({
+                    "worktree_id": worktree_id,
+                    "status": "discarded",
+                }))?,
                 false,
             ));
         }
@@ -2627,10 +2662,23 @@ impl Tool for SubagentResult {
             None,
         )
         .await?;
-        Ok(ToolResult::complete(
-            serde_json::to_string(&self.manager.wait(&agent_id).await?)?,
-            false,
-        ))
+        if let Some(agent_id) = agent_id {
+            Ok(ToolResult::complete(
+                serde_json::to_string(&self.manager.wait(&agent_id).await?)?,
+                false,
+            ))
+        } else {
+            let session = context
+                .session
+                .as_deref()
+                .context("worktree review requires a session")?;
+            let worktree_id = worktree_id.context("missing recovered worktree id")?;
+            let info = WorktreeManager::recover(session, &worktree_id)?;
+            let review = WorktreeManager::new(context.guard.root().to_path_buf())?
+                .review(&info)
+                .await?;
+            Ok(ToolResult::complete(serde_json::to_string(&review)?, false))
+        }
     }
 }
 

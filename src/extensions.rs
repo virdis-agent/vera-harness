@@ -1225,7 +1225,9 @@ impl StdioMcpTransport {
 impl McpTransport for StdioMcpTransport {
     async fn request(&self, method: &str, params: Value) -> Result<Value> {
         match method {
-            "tools/list" => Ok(serde_json::to_value(self.client.tools().await?)?),
+            "tools/list" => Ok(serde_json::json!({
+                "tools": self.client.tools().await?
+            })),
             "tools/call" => {
                 let name = params
                     .get("name")
