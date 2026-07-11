@@ -526,6 +526,15 @@ fn supported_mcp_protocol_version(version: &str) -> bool {
     matches!(version, MCP_PROTOCOL_VERSION | "2024-11-05")
 }
 
+fn valid_mcp_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= 128
+        && !value.contains("..")
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        })
+}
+
 /// Transport boundary for MCP. Phase 1 implements stdio; a future
 /// Streamable-HTTP transport can satisfy this trait without changing tool
 /// registration or permission evaluation.
@@ -559,7 +568,7 @@ impl PluginManifest {
         }
         let mut names = std::collections::BTreeSet::new();
         for mcp in &self.mcp {
-            if mcp.name.trim().is_empty() || !names.insert(&mcp.name) {
+            if !valid_mcp_component(&mcp.name) || !names.insert(&mcp.name) {
                 anyhow::bail!("plugin {} has duplicate MCP name", self.name);
             }
             if mcp.command.trim().is_empty() || mcp.timeout_ms == 0 {
@@ -1080,6 +1089,9 @@ impl McpClient {
                     continue;
                 };
                 if tool.name.trim().is_empty() {
+                    continue;
+                }
+                if !valid_mcp_component(&tool.name) {
                     continue;
                 }
                 if !seen_names.insert(tool.name.clone()) {
