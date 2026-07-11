@@ -1890,9 +1890,6 @@ impl Tool for ProcessWrite {
                 context.session.as_deref_mut(),
             )
             .await?;
-        if !self.manager.is_configured() {
-            anyhow::bail!("subagent provider runner is not configured");
-        }
         let session_id = context
             .session
             .as_deref()
@@ -2341,6 +2338,9 @@ impl Tool for SubagentSpawn {
                 context.session.as_deref_mut(),
             )
             .await?;
+        if !self.manager.is_configured() {
+            anyhow::bail!("subagent provider runner is not configured");
+        }
         let session_id = context
             .session
             .as_deref()

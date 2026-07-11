@@ -109,7 +109,7 @@ impl WorktreeManager {
         }
         let info = WorktreeInfo {
             worktree_id: worktree_id.clone(),
-            path,
+            path: path.clone(),
             branch,
             base_revision,
         };
