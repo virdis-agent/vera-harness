@@ -1,12 +1,12 @@
 class VeraHarness < Formula
   desc "macOS-first coding agent CLI"
   homepage "https://github.com/virdis-agent/vera-harness"
-  version "0.1.0-alpha.9"
+  version "0.1.0-alpha.12"
   license "MIT"
 
   on_arm do
     url "https://github.com/virdis-agent/vera-harness/releases/download/v#{version}/vera-#{version}-aarch64-apple-darwin.tar.gz"
-    sha256 "76a45bd3fd9dbbdb56f70316804ba21cf20e092bd2b2342b040f6a18a53217b0"
+    sha256 "ec2a466927c391dac91ffacb02d4a5351852e9e669ca1350ca40f2094201a8ac"
   end
 
   def install

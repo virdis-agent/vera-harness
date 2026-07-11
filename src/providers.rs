@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::auth::{AuthProvider, TokenRecord};
+use crate::auth::{AuthProvider, TokenRecord, redact};
 use crate::error::VeraError;
 use crate::events::{Event, EventSink};
 use crate::paths::{VeraPaths, set_private_file};
@@ -254,6 +254,15 @@ impl ResponsesProvider {
         }
     }
 
+    fn model_url(&self) -> Result<reqwest::Url> {
+        let mut url = reqwest::Url::parse(self.model_endpoint())?;
+        if self.kind == ProviderKind::OpenaiCodex {
+            url.query_pairs_mut()
+                .append_pair("client_version", env!("CARGO_PKG_VERSION"));
+        }
+        Ok(url)
+    }
+
     fn add_auth_headers(&self, mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         builder = builder.bearer_auth(&self.token.access_token);
         if let Some(account_id) = &self.token.account_id {
@@ -410,7 +419,7 @@ impl Provider for ResponsesProvider {
 
     async fn models(&self) -> Result<ModelCatalog> {
         let response = self
-            .add_auth_headers(self.http.get(self.model_endpoint()))
+            .add_auth_headers(self.http.get(self.model_url()?))
             .send()
             .await?;
         let expected_origin = match self.kind {
@@ -419,9 +428,10 @@ impl Provider for ResponsesProvider {
         };
         ensure_provider_origin(response.url(), expected_origin)?;
         if !response.status().is_success() {
+            let status = response.status();
+            let detail = safe_provider_detail(response).await;
             return Err(VeraError::Provider(format!(
-                "model discovery returned {}",
-                response.status()
+                "model discovery returned {status}: {detail}"
             ))
             .into());
         }
@@ -433,6 +443,21 @@ impl Provider for ResponsesProvider {
         Ok(ModelCatalog {
             models: BTreeMap::from([(self.kind.as_str().into(), models)]),
         })
+    }
+}
+
+async fn safe_provider_detail(response: reqwest::Response) -> String {
+    const MAX_CHARS: usize = 512;
+    let text = response.text().await.unwrap_or_default();
+    let redacted = redact(&text);
+    let mut chars = redacted.chars();
+    let detail: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{detail}…")
+    } else if detail.trim().is_empty() {
+        "provider returned no error details".into()
+    } else {
+        detail
     }
 }
 
@@ -917,8 +942,14 @@ mod tests {
             },
         )
         .unwrap();
+        let url = provider.model_url().unwrap();
+        assert_eq!(url.path(), "/backend-api/codex/models");
+        assert_eq!(
+            url.query(),
+            Some(format!("client_version={}", env!("CARGO_PKG_VERSION")).as_str())
+        );
         let request = provider
-            .add_auth_headers(provider.http.get(provider.model_endpoint()))
+            .add_auth_headers(provider.http.get(url))
             .build()
             .unwrap();
         assert_eq!(
