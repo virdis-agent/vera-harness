@@ -1022,6 +1022,7 @@ async fn run_headless(
     let active_specs = active_mcp_specs(&available_mcp, &config.enabled_mcp);
     let mut mcp_clients = Vec::new();
     let mut policy = config.permission_policy();
+    policy.restore_session_grants(session.approval_grants());
     let mut approval = TerminalApproval;
     if let Err(error) = refresh_mcp_tools(
         &mut registry,
@@ -1221,6 +1222,7 @@ async fn run_interactive(
         .await;
     let mut mcp_clients: Vec<Arc<crate::extensions::McpClient>> = Vec::new();
     let mut policy = config.permission_policy();
+    policy.restore_session_grants(session.approval_grants());
     let mut approval = TerminalApproval;
     let root_path = root.to_path_buf();
     run_hooks(

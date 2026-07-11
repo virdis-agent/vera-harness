@@ -439,8 +439,9 @@ impl SubagentRunner for InProcessSubagentRunner {
         session.add_message("user", &request.task)?;
 
         let mut policy = self.policy.clone();
-        // Ephemeral parent turn grants do not cross into a child session.
-        policy.begin_turn();
+        // Each child has its own permission view; neither ephemeral nor
+        // session-scoped parent grants cross the delegation boundary.
+        policy.clear_grants();
         if !request.writes {
             policy.set_mode(PermissionMode::Plan);
         }

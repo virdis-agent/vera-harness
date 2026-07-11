@@ -291,6 +291,17 @@ impl PermissionPolicy {
             .retain(|_, choice| *choice != ApprovalChoice::Turn);
     }
 
+    pub fn clear_grants(&mut self) {
+        self.grants.clear();
+    }
+
+    pub fn restore_session_grants(&mut self, grants: &[ActionSignature]) {
+        for action in grants {
+            self.grants
+                .insert(normalize_action_signature(action), ApprovalChoice::Session);
+        }
+    }
+
     pub fn cycle_mode(&mut self) {
         self.set_mode(self.mode.next());
     }
@@ -478,6 +489,7 @@ impl PermissionPolicy {
                     }
                     .into(),
                     granted: true,
+                    signature: None,
                 })?;
             }
             return Ok(());
@@ -493,13 +505,14 @@ impl PermissionPolicy {
             return Err(VeraError::Permission(format!("approval denied for {description}")).into());
         }
         if matches!(choice, ApprovalChoice::Turn | ApprovalChoice::Session) {
-            self.grants.insert(action, choice);
+            self.grants.insert(action.clone(), choice);
         }
         if let Some(session) = session {
             session.append(crate::sessions::SessionRecord::Approval {
                 action: description.into(),
                 scope: format!("{choice:?}"),
                 granted: true,
+                signature: (choice == ApprovalChoice::Session).then_some(action),
             })?;
         }
         Ok(())

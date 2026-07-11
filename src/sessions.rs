@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::paths::VeraPaths;
 use crate::prompt::approximate_tokens;
 use crate::providers::ProviderInput;
+use crate::safety::ActionSignature;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionHeader {
@@ -152,6 +153,8 @@ pub enum SessionRecord {
         action: String,
         scope: String,
         granted: bool,
+        #[serde(default)]
+        signature: Option<ActionSignature>,
     },
     FilePreimage {
         path: PathBuf,
@@ -227,6 +230,7 @@ pub struct Session {
     pub subagent_lifecycle: BTreeMap<String, LifecycleState>,
     pub worktree_lifecycle: BTreeMap<String, LifecycleState>,
     pub merge_decisions: BTreeMap<String, String>,
+    approval_grants: Vec<ActionSignature>,
     preimages: BTreeMap<PathBuf, Option<Vec<u8>>>,
 }
 
@@ -286,6 +290,7 @@ impl SessionStore {
             subagent_lifecycle: BTreeMap::new(),
             worktree_lifecycle: BTreeMap::new(),
             merge_decisions: BTreeMap::new(),
+            approval_grants: Vec::new(),
             preimages: BTreeMap::new(),
         };
         session.append(SessionRecord::Header(session.header.clone()))?;
@@ -314,6 +319,7 @@ impl SessionStore {
         let mut subagent_lifecycle = BTreeMap::new();
         let mut worktree_lifecycle = BTreeMap::new();
         let mut merge_decisions = BTreeMap::new();
+        let mut approval_grants = Vec::new();
         for line in BufReader::new(file).lines() {
             let record: SessionRecord = serde_json::from_str(&line?)?;
             match record {
@@ -360,6 +366,12 @@ impl SessionStore {
                 } => {
                     merge_decisions.insert(worktree_id, decision);
                 }
+                SessionRecord::Approval {
+                    scope,
+                    granted: true,
+                    signature: Some(signature),
+                    ..
+                } if scope == "Session" => approval_grants.push(signature),
                 _ => {}
             }
         }
@@ -389,6 +401,7 @@ impl SessionStore {
             subagent_lifecycle,
             worktree_lifecycle,
             merge_decisions,
+            approval_grants,
             preimages,
         })
     }
@@ -642,6 +655,10 @@ impl Session {
             authoritative: true,
         };
         self.append(SessionRecord::Usage(self.usage.clone()))
+    }
+
+    pub fn approval_grants(&self) -> &[ActionSignature] {
+        &self.approval_grants
     }
 
     pub fn record_estimate(&mut self, estimate: usize) -> Result<()> {
