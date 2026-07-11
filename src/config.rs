@@ -133,7 +133,7 @@ impl Config {
             .open(&temporary)?;
         file.write_all(contents.as_bytes())?;
         file.sync_all()?;
-        fs::rename(temporary, target)?;
+        fs::rename(temporary, &target)?;
         crate::paths::set_private_file(&target)?;
         Ok(())
     }
