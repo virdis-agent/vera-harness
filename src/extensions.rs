@@ -87,6 +87,9 @@ impl SkillCatalog {
         if !root.exists() {
             return Ok(());
         }
+        if fs::symlink_metadata(root)?.file_type().is_symlink() {
+            anyhow::bail!("skill root must not be a symlink: {}", root.display());
+        }
         if root.is_file() {
             if root.file_name().is_none_or(|name| name != "SKILL.md") {
                 anyhow::bail!("skill path must name SKILL.md: {}", root.display());
@@ -108,6 +111,9 @@ impl SkillCatalog {
         let mut names = std::collections::BTreeSet::new();
         for entry in fs::read_dir(root)? {
             let path = entry?.path();
+            if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+                anyhow::bail!("skill entry must not be a symlink: {}", path.display());
+            }
             let skill_file = if path.is_dir() {
                 path.join("SKILL.md")
             } else {
@@ -115,6 +121,9 @@ impl SkillCatalog {
             };
             if skill_file.file_name().is_none_or(|name| name != "SKILL.md") {
                 continue;
+            }
+            if fs::symlink_metadata(&skill_file)?.file_type().is_symlink() {
+                anyhow::bail!("skill file must not be a symlink: {}", skill_file.display());
             }
             let mut skill = parse_skill(&skill_file)?;
             if !allowed.is_empty() && !allowed.contains(&skill.name) {
@@ -271,6 +280,9 @@ impl PromptCatalog {
         if !root.exists() {
             return Ok(());
         }
+        if fs::symlink_metadata(root)?.file_type().is_symlink() {
+            anyhow::bail!("prompt root must not be a symlink: {}", root.display());
+        }
         if root.is_file() {
             if root.extension().and_then(|value| value.to_str()) != Some("md") {
                 anyhow::bail!("prompt path must name a Markdown file: {}", root.display());
@@ -285,6 +297,9 @@ impl PromptCatalog {
         let mut names = std::collections::BTreeSet::new();
         for entry in fs::read_dir(root)? {
             let path = entry?.path();
+            if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+                anyhow::bail!("prompt entry must not be a symlink: {}", path.display());
+            }
             if !path.is_file() || path.extension().and_then(|value| value.to_str()) != Some("md") {
                 continue;
             }
