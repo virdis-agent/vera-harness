@@ -567,7 +567,7 @@ async fn run_interactive(
                 .map(|plugin| format!("plugin:{}", plugin.name)),
         );
         let mcp_servers = McpRegistry::new(paths.clone()).list()?.len();
-        render_dashboard(&Dashboard {
+        let frame = render_dashboard(&Dashboard {
             version: env!("CARGO_PKG_VERSION"),
             root: &root_path,
             instructions: &instructions,
@@ -585,6 +585,7 @@ async fn run_interactive(
         if io::stdin().read_line(&mut line)? == 0 {
             break;
         }
+        frame.finish_input()?;
         let line = line.trim();
         if line.is_empty() {
             continue;
