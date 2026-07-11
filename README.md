@@ -4,6 +4,16 @@ Vera is a macOS-first coding-agent CLI with a small, replaceable Rust core. It l
 
 This is an `0.x` compatibility adapter for subscription OAuth flows exposed by the providers’ own CLIs. It currently targets Apple Silicon macOS 13+ and defaults to `gpt-5.6` through ChatGPT/Codex OAuth or `grok-4.5` through xAI OAuth.
 
+## Install
+
+Once the repository and release assets are publicly reachable, install the latest packaged arm64 build with one command:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/virdis-agent/vera-harness/main/packaging/install.sh | sh
+```
+
+The installer verifies the release archive against `SHA256SUMS` before placing `vera` in `~/.local/bin`. The repository is currently private, so this public raw-URL command will remain unavailable until the installer endpoint is made public; private checkouts can use the source install below.
+
 ## Status
 
 The repository contains the `0.1.0-alpha.1` core: manual CLI parsing, compact prompts, pinned OAuth/provider interfaces, protected token storage, Responses/SSE normalization, bounded tool calls, Seatbelt execution, approvals, plan mode, path/symlink guards, atomic edit journals, JSONL sessions/compaction, AGENTS.md and Skills discovery, hooks, local plugins, stdio MCP, and bounded subagent coordination.
@@ -13,6 +23,11 @@ Subscription OAuth is intentionally isolated in compatibility adapters. Real pro
 ## Build
 
 ```sh
+git clone https://github.com/virdis-agent/vera-harness.git
+cd vera-harness
+brew install rust
+cargo install --path . --locked
+
 cargo build --release
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
@@ -49,4 +64,3 @@ Sessions are append-only versioned JSONL under `~/.vera/sessions`. They record m
 ## License
 
 MIT. See [LICENSE](LICENSE).
-
