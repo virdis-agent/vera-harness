@@ -1434,7 +1434,7 @@ impl Tool for Question {
             .get("question_id")
             .and_then(Value::as_str)
             .filter(|value| !value.trim().is_empty())
-            .map(str::to_owned)
+            .map(|value| value.chars().take(128).collect())
             .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
         let choices = arguments
             .get("choices")
