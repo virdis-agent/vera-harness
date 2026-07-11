@@ -187,13 +187,12 @@ impl BrowserManager {
                 json!({"expression":"document.documentElement ? document.documentElement.outerHTML : ''","returnByValue":true}),
             )
             .await?;
-        let dom = dom
-            .pointer("/result/result/value")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .chars()
-            .take(MAX_SNAPSHOT_CHARS / 2)
-            .collect::<String>();
+        let dom = bound_snapshot_text(
+            dom.pointer("/result/result/value")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            MAX_SNAPSHOT_CHARS / 2,
+        );
         let accessibility = self
             .command("Accessibility.getFullAXTree", json!({}))
             .await
@@ -205,10 +204,10 @@ impl BrowserManager {
             .console_errors
             .into_iter()
             .rev()
-            .take(16)
+            .take(8)
             .map(|mut error| {
-                error.message = error.message.chars().take(500).collect();
-                error.url = error.url.chars().take(500).collect();
+                error.message = bound_snapshot_text(&error.message, 256);
+                error.url = bound_snapshot_text(&error.url, 256);
                 error
             })
             .collect::<Vec<_>>();
@@ -258,6 +257,23 @@ fn bound_snapshot_value(value: &Value, limit: usize) -> Value {
         return value.clone();
     }
     json!({"truncated":true,"original_bytes":encoded.len()})
+}
+
+fn bound_snapshot_text(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_owned();
+    }
+    let marker = "\n[truncated]";
+    let mut text = String::new();
+    let keep = limit.saturating_sub(marker.len());
+    for character in value.chars() {
+        if text.len().saturating_add(character.len_utf8()) > keep {
+            break;
+        }
+        text.push(character);
+    }
+    text.push_str(marker);
+    text
 }
 
 fn record_console_event(status: &mut BrowserStatus, event: &Value) {
