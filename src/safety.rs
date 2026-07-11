@@ -12,6 +12,8 @@ use tokio::time::{Duration, timeout};
 use crate::error::VeraError;
 use crate::sessions::Session;
 
+const MAX_FOREGROUND_OUTPUT_BYTES: usize = 256 * 1024;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionKind {
@@ -729,10 +731,26 @@ impl Sandbox {
             .context("command timed out")??;
         Ok(CommandOutput {
             status: output.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            stdout: bounded_output(&output.stdout),
+            stderr: bounded_output(&output.stderr),
         })
     }
+}
+
+fn bounded_output(bytes: &[u8]) -> String {
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    let marker = "\n[output truncated]\n";
+    if text.len() <= MAX_FOREGROUND_OUTPUT_BYTES {
+        return text;
+    }
+    let keep = MAX_FOREGROUND_OUTPUT_BYTES.saturating_sub(marker.len());
+    let mut end = keep.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text.push_str(marker);
+    text
 }
 
 #[cfg(target_os = "macos")]
@@ -961,5 +979,12 @@ mod tests {
         };
         assert!(!policy.check_action(&denied));
         assert!(policy.check_action(&allowed));
+    }
+
+    #[test]
+    fn foreground_output_is_bounded_with_a_marker() {
+        let output = bounded_output(&vec![b'x'; MAX_FOREGROUND_OUTPUT_BYTES + 1]);
+        assert!(output.ends_with("[output truncated]\n"));
+        assert!(output.len() <= MAX_FOREGROUND_OUTPUT_BYTES);
     }
 }
