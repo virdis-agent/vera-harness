@@ -564,11 +564,22 @@ impl SubagentRunner for InProcessSubagentRunner {
         let Ok(mut parent) = SessionStore::new(self.paths.clone()).open(&request.session_id) else {
             return Ok(());
         };
+        let child_session_id = request.child_session_id.lock().await.clone();
+        let detail = child_session_id.map_or_else(
+            || bound_summary(detail),
+            |child_session_id| {
+                serde_json::json!({
+                    "child_session_id": child_session_id,
+                    "detail": bound_summary(detail),
+                })
+                .to_string()
+            },
+        );
         parent.record_subagent_lifecycle(
             request.agent_id.clone(),
             LifecycleState {
                 state: state.into(),
-                detail: Some(bound_summary(detail)),
+                detail: Some(detail),
             },
         )?;
         Ok(())
