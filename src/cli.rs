@@ -196,7 +196,7 @@ impl CommandLine {
                         parse_plugin(&args[index + 1..])?,
                     ));
                 }
-                "update" => {
+                "update" | "upgrade" => {
                     return Ok(Self {
                         command: Command::Update,
                         path,
@@ -346,5 +346,11 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn parses_upgrade_alias() {
+        let cli = CommandLine::try_parse(vec!["upgrade".into()]).unwrap();
+        assert!(matches!(cli.command, Command::Update));
     }
 }

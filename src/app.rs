@@ -1,8 +1,13 @@
+use std::fmt::Write as FmtWrite;
+use std::fs;
 use std::io;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use reqwest::header::LOCATION;
+use sha2::{Digest, Sha256};
 use tokio::time::{Duration, sleep};
+use uuid::Uuid;
 
 use crate::auth::{AuthProvider, OAuthClient, TokenRecord, TokenStore, now_seconds, pkce_pair};
 use crate::cli::{
@@ -34,9 +39,7 @@ pub async fn run(cli: CommandLine) -> Result<()> {
         Command::Inspect => inspect(&paths, &root, &config)?,
         Command::Mcp(command) => run_mcp(&paths, command).await?,
         Command::Plugin(command) => run_plugin(&paths, command).await?,
-        Command::Update => println!(
-            "Update Vera through Homebrew (`brew upgrade vera-harness`) or rerun the verified installer."
-        ),
+        Command::Update => run_upgrade(&paths).await?,
         Command::Prompt => {
             let prompt = cli.prompt.context("prompt is required")?;
             run_headless(
@@ -53,6 +56,178 @@ pub async fn run(cli: CommandLine) -> Result<()> {
         Command::Interactive => {
             run_interactive(&paths, &root, config, cli.provider, cli.model).await?
         }
+    }
+    Ok(())
+}
+
+const GITHUB_API_ROOT: &str = "https://api.github.com";
+const VERA_REPOSITORY: &str = "virdis-agent/vera-harness";
+
+async fn run_upgrade(paths: &VeraPaths) -> Result<()> {
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    anyhow::bail!("automatic upgrades currently support Apple Silicon macOS only");
+
+    let marker = paths.root.join("installer-version");
+    if !marker.exists() {
+        anyhow::bail!(
+            "this Vera copy is not installer-managed; use `cargo install --path . --locked` or `brew upgrade vera-harness`"
+        );
+    }
+    let current = fs::read_to_string(&marker)?.trim().to_owned();
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(format!("vera/{}", env!("CARGO_PKG_VERSION")))
+        .build()?;
+    let releases_url = format!("{GITHUB_API_ROOT}/repos/{VERA_REPOSITORY}/releases?per_page=20");
+    let response = client.get(&releases_url).send().await?;
+    validate_github_response(&response, "api.github.com")?;
+    let releases: Vec<serde_json::Value> = response.json().await?;
+    let (version, archive_id, checksum_id) = find_release_assets(&releases)?;
+    if version == current {
+        println!("Vera {current} is already up to date.");
+        return Ok(());
+    }
+
+    let archive_name = format!("vera-{version}-aarch64-apple-darwin.tar.gz");
+    let archive = fetch_release_asset(&client, archive_id).await?;
+    let checksums = fetch_release_asset(&client, checksum_id).await?;
+    let expected = checksum_for(&checksums, &archive_name)
+        .context("release checksum does not contain the arm64 archive")?;
+    let actual = sha256_hex(&archive);
+    if actual != expected {
+        anyhow::bail!("release checksum verification failed");
+    }
+
+    let temp_dir = std::env::temp_dir().join(format!("vera-upgrade-{}", Uuid::new_v4()));
+    fs::create_dir_all(&temp_dir)?;
+    let archive_path = temp_dir.join(&archive_name);
+    fs::write(&archive_path, &archive)?;
+    let status = tokio::process::Command::new("/usr/bin/tar")
+        .arg("-xzf")
+        .arg(&archive_path)
+        .arg("-C")
+        .arg(&temp_dir)
+        .env_clear()
+        .env("HOME", &paths.home)
+        .status()
+        .await?;
+    if !status.success() {
+        anyhow::bail!("could not extract the verified Vera release");
+    }
+
+    let extracted = temp_dir.join("vera");
+    if !extracted.is_file() {
+        anyhow::bail!("verified Vera release did not contain a binary");
+    }
+    let target = paths.home.join(".local/bin/vera");
+    if !target.is_file() {
+        anyhow::bail!(
+            "installer-managed Vera binary was not found at {}",
+            target.display()
+        );
+    }
+    let temporary_target = target
+        .parent()
+        .context("installer binary has no parent directory")?
+        .join(format!(".vera-upgrade-{}", Uuid::new_v4()));
+    fs::copy(&extracted, &temporary_target)?;
+    set_executable(&temporary_target)?;
+    fs::rename(&temporary_target, &target)?;
+    fs::write(&marker, &version)?;
+    println!("Updated Vera {current} → {version}.");
+    Ok(())
+}
+
+fn find_release_assets(releases: &[serde_json::Value]) -> Result<(String, u64, u64)> {
+    for release in releases {
+        let Some(tag) = release.get("tag_name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let version = tag.strip_prefix('v').unwrap_or(tag);
+        let archive_name = format!("vera-{version}-aarch64-apple-darwin.tar.gz");
+        let Some(assets) = release.get("assets").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        let archive_id = assets.iter().find_map(|asset| {
+            (asset.get("name").and_then(serde_json::Value::as_str) == Some(archive_name.as_str()))
+                .then(|| asset.get("id").and_then(serde_json::Value::as_u64))
+                .flatten()
+        });
+        let checksum_id = assets.iter().find_map(|asset| {
+            (asset.get("name").and_then(serde_json::Value::as_str) == Some("SHA256SUMS"))
+                .then(|| asset.get("id").and_then(serde_json::Value::as_u64))
+                .flatten()
+        });
+        if let (Some(archive_id), Some(checksum_id)) = (archive_id, checksum_id) {
+            return Ok((version.to_owned(), archive_id, checksum_id));
+        }
+    }
+    anyhow::bail!("no compatible Vera release assets were found")
+}
+
+async fn fetch_release_asset(client: &reqwest::Client, asset_id: u64) -> Result<Vec<u8>> {
+    let url = format!("{GITHUB_API_ROOT}/repos/{VERA_REPOSITORY}/releases/assets/{asset_id}");
+    let response = client
+        .get(&url)
+        .header("Accept", "application/octet-stream")
+        .send()
+        .await?;
+    if response.status().is_redirection() {
+        let location = response
+            .headers()
+            .get(LOCATION)
+            .context("GitHub asset redirect did not include a location")?
+            .to_str()?
+            .to_owned();
+        let location = reqwest::Url::parse(&location)?;
+        if location.scheme() != "https"
+            || location.host_str() != Some("release-assets.githubusercontent.com")
+        {
+            anyhow::bail!("GitHub release asset origin validation failed");
+        }
+        let redirected = client.get(location).send().await?;
+        if !redirected.status().is_success() {
+            anyhow::bail!("GitHub release asset returned {}", redirected.status());
+        }
+        return Ok(redirected.bytes().await?.to_vec());
+    }
+    validate_github_response(&response, "api.github.com")?;
+    Ok(response.bytes().await?.to_vec())
+}
+
+fn validate_github_response(response: &reqwest::Response, host: &str) -> Result<()> {
+    if response.url().scheme() != "https"
+        || response.url().host_str() != Some(host)
+        || !response.status().is_success()
+    {
+        anyhow::bail!("GitHub API origin or response validation failed");
+    }
+    Ok(())
+}
+
+fn checksum_for(checksums: &[u8], filename: &str) -> Option<String> {
+    String::from_utf8_lossy(checksums).lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let checksum = fields.next()?;
+        let name = fields.next()?.trim_start_matches('*');
+        (name == filename).then(|| checksum.to_owned())
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+fn set_executable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
     }
     Ok(())
 }
@@ -534,7 +709,7 @@ async fn usable_token(store: &TokenStore, kind: ProviderKind) -> Result<Option<T
 
 fn print_help() {
     println!(
-        "vera [path]\nvera -p \"prompt\" --output text|jsonl\n\nCommands:\n  auth login|status|logout\n  models [--refresh]\n  session list|resume <id>\n  inspect\n  mcp list|test <name>\n  plugin add|list|remove\n  update"
+        "vera [path]\nvera -p \"prompt\" --output text|jsonl\n\nCommands:\n  auth login|status|logout\n  models [--refresh]\n  session list|resume <id>\n  inspect\n  mcp list|test <name>\n  plugin add|list|remove\n  update|upgrade"
     );
 }
 

@@ -16,7 +16,7 @@ The installer verifies the release archive against `SHA256SUMS` before placing `
 
 ## Status
 
-The repository contains the `0.1.0-alpha.2` core: manual CLI parsing, compact prompts, pinned OAuth/provider interfaces, protected token storage, Responses/SSE normalization, bounded tool calls, Seatbelt execution, approvals, plan mode, path/symlink guards, atomic edit journals, JSONL sessions/compaction, AGENTS.md and Skills discovery, hooks, local plugins, stdio MCP, bounded subagent coordination, and a compact colored terminal dashboard.
+The repository contains the `0.1.0-alpha.3` core: manual CLI parsing, compact prompts, pinned OAuth/provider interfaces, protected token storage, Responses/SSE normalization, bounded tool calls, Seatbelt execution, approvals, plan mode, path/symlink guards, atomic edit journals, JSONL sessions/compaction, AGENTS.md and Skills discovery, hooks, local plugins, stdio MCP, bounded subagent coordination, a compact colored terminal dashboard, and verified in-place upgrades.
 
 Subscription OAuth is intentionally isolated in compatibility adapters. Real provider accounts and live endpoint contracts should be smoke-tested before each release.
 
@@ -47,6 +47,7 @@ vera auth login xai-oauth --no-browser
 vera models --refresh
 vera inspect
 vera session list
+vera upgrade
 ```
 
 Interactive commands include `/provider`, `/model`, `/plan`, `/permissions`, `/compact`, `/context`, `/diff`, `/undo`, `/resume`, `/skills`, `/mcp`, `/agents`, and `/quit`.
@@ -59,7 +60,7 @@ Sessions are append-only versioned JSONL under `~/.vera/sessions`. They record m
 
 ## Distribution
 
-`packaging/install.sh` selects the arm64 macOS artifact and verifies `SHA256SUMS` before installation. Homebrew users should use the formula in `packaging/homebrew/vera-harness.rb`; `vera update` directs Homebrew-managed copies to `brew upgrade`.
+`packaging/install.sh` selects the arm64 macOS artifact and verifies `SHA256SUMS` before installation. Installer-managed copies update in place with `vera upgrade` (or `vera update`). Cargo- and Homebrew-managed copies should use `cargo install --path . --locked` or `brew upgrade vera-harness` instead.
 
 ## License
 
