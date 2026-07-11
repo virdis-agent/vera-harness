@@ -37,6 +37,16 @@ const GOLD: Color = Color::Rgb {
     g: 193,
     b: 91,
 };
+const PLAN: Color = Color::Rgb {
+    r: 112,
+    g: 166,
+    b: 232,
+};
+const YOLO: Color = Color::Rgb {
+    r: 224,
+    g: 108,
+    b: 117,
+};
 const MUTED: Color = Color::Rgb {
     r: 104,
     g: 104,
@@ -47,11 +57,15 @@ const DIM: Color = Color::Rgb {
     g: 150,
     b: 150,
 };
-const BORDER: Color = Color::Rgb {
-    r: 177,
-    g: 92,
-    b: 96,
-};
+
+fn mode_color(mode: PermissionMode) -> Color {
+    match mode {
+        PermissionMode::Plan => PLAN,
+        PermissionMode::Confirm => GOLD,
+        PermissionMode::Auto => TEAL,
+        PermissionMode::Yolo => YOLO,
+    }
+}
 
 pub struct DashboardFrame {
     line: String,
@@ -139,11 +153,11 @@ pub fn render_dashboard(dashboard: &Dashboard<'_>) -> Result<DashboardFrame> {
     let footer_line = format!("{}{}{}", footer_left, " ".repeat(footer_gap), footer_right);
     let interactive = stdout.is_terminal();
     if interactive {
-        println!("{}", line.clone().with(BORDER));
+        println!("{}", line.clone().with(mode_color(dashboard.mode)));
     } else {
         println!("{line}");
     }
-    print!("{}", "> ".with(DIM));
+    print!("{}", "> ".with(mode_color(dashboard.mode)));
     stdout.flush()?;
     let (_, prompt_row) = if interactive {
         cursor::position()?
@@ -185,10 +199,11 @@ fn draw_decorations(
     colored: bool,
 ) {
     if colored {
-        println!("{}", line.with(BORDER));
+        let color = mode_color(mode);
+        println!("{}", line.with(color));
         println!("{}", footer_line.with(MUTED));
         print!("{} ", format!("MCP: {mcp_servers}/4 servers").with(TEAL));
-        println!("{}", format!("⏵ {}", mode.label()).with(GOLD));
+        println!("{}", format!("⏵ {}", mode.label()).with(color));
     } else {
         println!("{line}");
         println!("{footer_line}");
@@ -304,7 +319,8 @@ fn wrap(entries: &[String], width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::wrap;
+    use super::{mode_color, wrap};
+    use crate::safety::PermissionMode;
 
     #[test]
     fn wraps_context_lists() {
@@ -312,5 +328,18 @@ mod tests {
         let lines = wrap(&entries, 10);
         assert!(lines.len() > 1);
         assert!(lines.iter().all(|line| line.len() <= 10));
+    }
+
+    #[test]
+    fn permission_modes_have_distinct_colors() {
+        let colors = [
+            mode_color(PermissionMode::Plan),
+            mode_color(PermissionMode::Confirm),
+            mode_color(PermissionMode::Auto),
+            mode_color(PermissionMode::Yolo),
+        ];
+        for (index, color) in colors.iter().enumerate() {
+            assert!(!colors[index + 1..].contains(color));
+        }
     }
 }
