@@ -1890,6 +1890,9 @@ impl Tool for ProcessWrite {
                 context.session.as_deref_mut(),
             )
             .await?;
+        if !self.manager.is_configured() {
+            anyhow::bail!("subagent provider runner is not configured");
+        }
         let session_id = context
             .session
             .as_deref()
@@ -2346,6 +2349,9 @@ impl Tool for SubagentSpawn {
         let root = context.guard.root().to_path_buf();
         let mut results = Vec::new();
         for task in tasks.into_iter().take(4) {
+            if task.trim().is_empty() {
+                anyhow::bail!("subagent task must not be empty");
+            }
             let worktree_path = if writes {
                 let session = context
                     .session

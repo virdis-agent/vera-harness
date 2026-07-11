@@ -113,13 +113,26 @@ impl WorktreeManager {
             branch,
             base_revision,
         };
-        session.record_worktree_state(
+        if let Err(error) = session.record_worktree_state(
             worktree_id,
             LifecycleState {
                 state: "created".into(),
                 detail: Some(serde_json::to_string(&info)?),
             },
-        )?;
+        ) {
+            let _ = self
+                .git_mutating(
+                    &[
+                        "worktree",
+                        "remove",
+                        "--force",
+                        path.to_str().unwrap_or_default(),
+                    ],
+                    &self.repository,
+                )
+                .await;
+            return Err(error);
+        }
         Ok(info)
     }
 

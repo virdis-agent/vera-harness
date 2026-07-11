@@ -109,6 +109,14 @@ impl SubagentManager {
         }
     }
 
+    pub fn is_configured(&self) -> bool {
+        self.runner
+            .read()
+            .ok()
+            .and_then(|runner| runner.as_ref().map(|_| ()))
+            .is_some()
+    }
+
     pub async fn spawn(
         &self,
         task: String,

@@ -441,6 +441,7 @@ impl HookRunner {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        command.kill_on_drop(true);
         let mut child = command.spawn()?;
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(&payload).await?;
@@ -885,6 +886,7 @@ impl McpClient {
                     .current_dir(&self.root);
                 command
             };
+            command.kill_on_drop(true);
             command.env("VERA_REPOSITORY_ROOT", &self.root);
             let mut child = command.spawn().context("spawn MCP server")?;
             let stdin = child.stdin.take().context("MCP stdin unavailable")?;

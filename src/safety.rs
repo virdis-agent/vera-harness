@@ -721,9 +721,9 @@ impl Sandbox {
         network: bool,
         limit: Duration,
     ) -> Result<CommandOutput> {
-        let child = Self::command(program, args, cwd, network)
-            .spawn()
-            .context("spawn sandboxed command")?;
+        let mut command = Self::command(program, args, cwd, network);
+        command.kill_on_drop(true);
+        let child = command.spawn().context("spawn sandboxed command")?;
         let output = timeout(limit, child.wait_with_output())
             .await
             .context("command timed out")??;
