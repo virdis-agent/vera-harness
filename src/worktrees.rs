@@ -329,6 +329,23 @@ impl WorktreeManager {
         Ok(())
     }
 
+    /// Reconstruct a worktree descriptor from the durable session journal so
+    /// an interrupted parent can inspect or discard an abandoned worktree.
+    pub fn recover(session: &Session, worktree_id: &str) -> Result<WorktreeInfo> {
+        let state = session
+            .worktree_lifecycle
+            .get(worktree_id)
+            .context("worktree is not recorded in this session")?;
+        if matches!(state.state.as_str(), "discarded" | "merged") {
+            anyhow::bail!("worktree is already {}", state.state);
+        }
+        let detail = state
+            .detail
+            .as_deref()
+            .context("worktree lifecycle is missing recovery metadata")?;
+        serde_json::from_str(detail).context("invalid worktree recovery metadata")
+    }
+
     fn validate_info(&self, info: &WorktreeInfo) -> Result<()> {
         let expected_path = self.worktree_root.join(&info.worktree_id);
         if info.path != expected_path
@@ -612,6 +629,12 @@ mod tests {
             .unwrap();
         let manager = WorktreeManager::for_fixture(repository.clone()).unwrap();
         let info = manager.create(&mut session).await.unwrap();
+        assert_eq!(
+            WorktreeManager::recover(&session, &info.worktree_id)
+                .unwrap()
+                .path,
+            info.path
+        );
         let lifecycle_detail = session
             .worktree_lifecycle
             .get(&info.worktree_id)

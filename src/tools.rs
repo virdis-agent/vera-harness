@@ -2501,7 +2501,7 @@ impl Tool for SubagentDiscard {
         ToolSchema {
             name: "subagent_discard".into(),
             description: "Discard an explicitly reviewed write-agent worktree.".into(),
-            parameters: json!({"type":"object","properties":{"agent_id":{"type":"string"}},"required":["agent_id"]}),
+            parameters: json!({"type":"object","properties":{"agent_id":{"type":"string"},"worktree_id":{"type":"string"}},"required":[]}),
         }
     }
 
@@ -2524,19 +2524,30 @@ impl Tool for SubagentDiscard {
             .session
             .as_deref_mut()
             .context("worktree decisions require a session")?;
-        let snapshot = self
-            .manager
-            .discard(subagent_id(&arguments)?, session)
+        if let Some(agent_id) = arguments.get("agent_id").and_then(Value::as_str) {
+            let snapshot = self.manager.discard(agent_id, session).await?;
+            session.record_subagent_lifecycle(
+                snapshot.agent_id.clone(),
+                crate::sessions::LifecycleState {
+                    state: snapshot.status.clone(),
+                    detail: Some(snapshot.summary.clone()),
+                },
+            )?;
+            return Ok(ToolResult::complete(
+                serde_json::to_string(&snapshot)?,
+                false,
+            ));
+        }
+        let worktree_id = arguments
+            .get("worktree_id")
+            .and_then(Value::as_str)
+            .context("subagent_discard requires agent_id or worktree_id")?;
+        let info = WorktreeManager::recover(session, worktree_id)?;
+        WorktreeManager::new(context.guard.root().to_path_buf())?
+            .discard(&info, session)
             .await?;
-        session.record_subagent_lifecycle(
-            snapshot.agent_id.clone(),
-            crate::sessions::LifecycleState {
-                state: snapshot.status.clone(),
-                detail: Some(snapshot.summary.clone()),
-            },
-        )?;
         Ok(ToolResult::complete(
-            serde_json::to_string(&snapshot)?,
+            format!("discarded recovered worktree {worktree_id}"),
             false,
         ))
     }

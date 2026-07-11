@@ -1474,6 +1474,11 @@ async fn run_interactive(
                 for agent in registry.subagents().list(&session.header.id).await {
                     println!("{}\t{}\t{}", agent.agent_id, agent.status, agent.task);
                 }
+                for (worktree_id, state) in &session.worktree_lifecycle {
+                    if !matches!(state.state.as_str(), "discarded" | "merged") {
+                        println!("worktree:{worktree_id}\t{}\trecoverable", state.state);
+                    }
+                }
                 None
             }
             command if command.starts_with("/agent ") => {
