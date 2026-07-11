@@ -16,7 +16,7 @@ The installer verifies the release archive against `SHA256SUMS` before placing `
 
 ## Status
 
-The repository contains the `0.1.0-alpha.6` core: manual CLI parsing, compact prompts, pinned OAuth/provider interfaces, protected token storage, Responses/SSE normalization, bounded tool calls, Seatbelt execution, Plan/Confirm/Auto/Yolo permission modes, Shift+Tab mode switching, mode-specific prompt and border colors, path/symlink guards, atomic edit journals, JSONL sessions/compaction, AGENTS.md and Skills discovery, hooks, local plugins, stdio MCP, bounded subagent coordination, a compact colored terminal dashboard, and verified in-place upgrades.
+The repository contains the `0.1.0-alpha.7` core: manual CLI parsing, compact prompts, pinned OAuth/provider interfaces, protected token storage, Responses/SSE normalization, bounded tool calls, Seatbelt execution, Plan/Confirm/Auto/Yolo permission modes, Shift+Tab mode switching, mode-specific prompt and border colors, double Ctrl+C exit handling, path/symlink guards, atomic edit journals, JSONL sessions/compaction, AGENTS.md and Skills discovery, hooks, local plugins, stdio MCP, bounded subagent coordination, a compact colored terminal dashboard, and verified in-place upgrades.
 
 Subscription OAuth is intentionally isolated in compatibility adapters. Real provider accounts and live endpoint contracts should be smoke-tested before each release.
 

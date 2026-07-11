@@ -544,6 +544,7 @@ async fn run_interactive(
         "/compact".into(),
         "/undo".into(),
     ];
+    let mut ctrl_c_pending = false;
     loop {
         let instructions = context
             .instructions
@@ -582,7 +583,7 @@ async fn run_interactive(
             context_limit: config.context_window_tokens,
             mode: policy.mode(),
         })?;
-        let line = match read_input()? {
+        let line = match read_input(&mut ctrl_c_pending)? {
             InputAction::CycleMode => {
                 policy.cycle_mode();
                 continue;
