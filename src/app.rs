@@ -508,17 +508,145 @@ fn resolve_effort(model: &ModelInfo, requested: Option<&str>) -> Result<Option<S
     }
 }
 
-fn pick_model(models: &[ModelInfo]) -> Result<Option<String>> {
+fn parse_numbered_selection(input: &str, choices: &[String]) -> Result<Option<String>> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(None);
+    }
+    if let Ok(index) = input.parse::<usize>() {
+        if index == 0 {
+            anyhow::bail!("selection 0 is out of range (1-{})", choices.len());
+        }
+        return choices
+            .get(index - 1)
+            .cloned()
+            .map(Some)
+            .with_context(|| format!("selection {index} is out of range (1-{})", choices.len()));
+    }
+    choices
+        .iter()
+        .find(|choice| choice.as_str() == input)
+        .cloned()
+        .map(Some)
+        .with_context(|| format!("unknown selection {input:?}"))
+}
+
+fn pick_model(
+    models: &[ModelInfo],
+    active: &str,
+    ctrl_c_pending: &mut bool,
+) -> Result<Option<String>> {
     if models.is_empty() {
         println!("no models are available");
         return Ok(None);
     }
     println!("available models:");
     for (index, model) in models.iter().enumerate() {
-        println!("  {}. {} ({})", index + 1, model.id, model.context_window);
+        let marker = if model.id == active { " (active)" } else { "" };
+        println!(
+            "  {}. {} ({} tokens){}",
+            index + 1,
+            model.id,
+            model.context_window,
+            marker
+        );
     }
-    println!("use /model <id> to select a model");
-    Ok(None)
+    print!("select a model (number or id, blank/Esc to cancel): ");
+    std::io::Write::flush(&mut std::io::stdout())?;
+    let choices = models
+        .iter()
+        .map(|model| model.id.clone())
+        .collect::<Vec<_>>();
+    loop {
+        match read_input(ctrl_c_pending)? {
+            InputAction::Submit(input) => match parse_numbered_selection(&input, &choices) {
+                Ok(selection) => return Ok(selection),
+                Err(error) => {
+                    print!("{error}; try again (blank to cancel): ");
+                    std::io::Write::flush(&mut std::io::stdout())?;
+                }
+            },
+            InputAction::Cancel | InputAction::CycleMode | InputAction::Exit => return Ok(None),
+        }
+    }
+}
+
+fn pick_effort(
+    model: &ModelInfo,
+    active: Option<&str>,
+    ctrl_c_pending: &mut bool,
+) -> Result<Option<String>> {
+    if model.supported_efforts.is_empty() {
+        println!("{} uses provider-controlled effort", model.id);
+        return Ok(None);
+    }
+    let mut choices = vec!["auto".to_owned()];
+    choices.extend(model.supported_efforts.iter().cloned());
+    println!("effort levels for {}:", model.id);
+    for (index, effort) in choices.iter().enumerate() {
+        let default = if effort == "auto" {
+            " (model default)"
+        } else {
+            ""
+        };
+        let marker = if active == Some(effort.as_str()) {
+            " (active)"
+        } else {
+            ""
+        };
+        println!("  {}. {}{}{}", index + 1, effort, default, marker);
+    }
+    print!("select effort (number or name, blank/Esc to cancel): ");
+    std::io::Write::flush(&mut std::io::stdout())?;
+    loop {
+        match read_input(ctrl_c_pending)? {
+            InputAction::Submit(input) => match parse_numbered_selection(&input, &choices) {
+                Ok(selection) => return Ok(selection),
+                Err(error) => {
+                    print!("{error}; try again (blank to cancel): ");
+                    std::io::Write::flush(&mut std::io::stdout())?;
+                }
+            },
+            InputAction::Cancel | InputAction::CycleMode | InputAction::Exit => return Ok(None),
+        }
+    }
+}
+
+fn apply_model_selection(
+    config: &mut Config,
+    model_info: &mut ModelInfo,
+    session: &mut crate::sessions::Session,
+    model: ModelInfo,
+) -> Result<String> {
+    let selection = CapabilitySelection {
+        model: model.id.clone(),
+        effort: Some("auto".into()),
+        model_context_window: model.context_window,
+        ..session.selection.clone()
+    };
+    let effective_effort = resolve_effort(&model, selection.effort.as_deref())?
+        .unwrap_or_else(|| "provider-controlled".into());
+    session.set_selection(selection)?;
+    config.model = model.id.clone();
+    config.effort = Some("auto".into());
+    *model_info = model;
+    Ok(effective_effort)
+}
+
+fn apply_effort_selection(
+    config: &mut Config,
+    model: &ModelInfo,
+    session: &mut crate::sessions::Session,
+    requested: &str,
+) -> Result<String> {
+    let effective =
+        resolve_effort(model, Some(requested))?.unwrap_or_else(|| "provider-controlled".into());
+    session.set_selection(CapabilitySelection {
+        effort: Some(requested.to_owned()),
+        ..session.selection.clone()
+    })?;
+    config.effort = Some(requested.to_owned());
+    Ok(effective)
 }
 
 async fn select_provider(
@@ -1743,19 +1871,20 @@ async fn run_interactive(
             "/model" => {
                 let kind = ProviderKind::parse(&config.provider)?;
                 let catalog = provider_catalog_for(paths, kind).await?;
-                match pick_model(catalog.for_provider(kind))? {
+                match pick_model(
+                    catalog.for_provider(kind),
+                    &config.model,
+                    &mut ctrl_c_pending,
+                )? {
                     Some(id) => {
                         let model = resolve_model_from_catalog(&catalog, kind, &id)?;
-                        model_info = model.clone();
-                        config.model = model.id.clone();
-                        config.effort = Some("auto".into());
-                        session.set_selection(CapabilitySelection {
-                            model: model.id.clone(),
-                            effort: config.effort.clone(),
-                            model_context_window: model.context_window,
-                            ..session.selection.clone()
-                        })?;
-                        println!("model: {}", config.model);
+                        let effort = apply_model_selection(
+                            &mut config,
+                            &mut model_info,
+                            &mut session,
+                            model,
+                        )?;
+                        println!("model: {} (effort: {effort})", config.model);
                     }
                     None => println!("model selection cancelled"),
                 }
@@ -1773,49 +1902,31 @@ async fn run_interactive(
                 None
             }
             "/effort" => {
-                if model_info.supported_efforts.is_empty() {
-                    println!("{} uses provider-controlled effort", model_info.id);
-                } else {
-                    println!("effort levels for {}:", model_info.id);
-                    for level in &model_info.supported_efforts {
-                        let marker = if Some(level.as_str()) == model_info.default_effort.as_deref()
-                        {
-                            " (default)"
-                        } else {
-                            ""
-                        };
-                        println!("  {level}{marker}");
-                    }
+                if let Some(value) = pick_effort(
+                    &model_info,
+                    session.selection.effort.as_deref(),
+                    &mut ctrl_c_pending,
+                )? {
+                    let effort =
+                        apply_effort_selection(&mut config, &model_info, &mut session, &value)?;
+                    println!("effort: {effort}");
+                } else if !model_info.supported_efforts.is_empty() {
+                    println!("effort selection cancelled");
                 }
                 None
             }
             command if command.starts_with("/effort ") => {
                 let value = command[8..].trim();
-                let effort = resolve_effort(&model_info, Some(value))?;
-                config.effort = Some(value.to_owned());
-                session.set_selection(CapabilitySelection {
-                    effort: config.effort.clone(),
-                    ..session.selection.clone()
-                })?;
-                println!(
-                    "effort: {}",
-                    effort.as_deref().unwrap_or("provider-controlled")
-                );
+                let effort = apply_effort_selection(&mut config, &model_info, &mut session, value)?;
+                println!("effort: {effort}");
                 None
             }
             command if command.starts_with("/model ") => {
                 let kind = ProviderKind::parse(&config.provider)?;
                 let model = resolve_live_model(paths, kind, command[7..].trim()).await?;
-                model_info = model.clone();
-                config.model = model.id.clone();
-                config.effort = Some("auto".into());
-                session.set_selection(CapabilitySelection {
-                    model: config.model.clone(),
-                    effort: config.effort.clone(),
-                    model_context_window: model.context_window,
-                    ..session.selection.clone()
-                })?;
-                println!("model: {}", config.model);
+                let effort =
+                    apply_model_selection(&mut config, &mut model_info, &mut session, model)?;
+                println!("model: {} (effort: {effort})", config.model);
                 None
             }
             command if command.starts_with("/resume ") => {
@@ -2191,7 +2302,7 @@ fn print_help() {
 
 fn print_interactive_help() {
     println!(
-        "shift+tab cycle modes  /plan  /confirm  /auto  /yolo  /provider <id>  /models  /model <id>  /effort <level>  /permissions [deny|ask|allow] <kind>  /processes  /compact  /context  /diff  /undo  /resume <id>  /skills  /skill load|unload <name>  /prompts  /prompt <name> [args]  /extensions  /extension enable|disable <name>  /mcp enable|disable <name>  /agents  /agent <id>  /quit"
+        "shift+tab cycle modes  /plan  /confirm  /auto  /yolo  /provider <id>  /models  /model [<id>]  /effort [<level>]  /permissions [deny|ask|allow] <kind>  /processes  /compact  /context  /diff  /undo  /resume <id>  /skills  /skill load|unload <name>  /prompts  /prompt <name> [args]  /extensions  /extension enable|disable <name>  /mcp enable|disable <name>  /agents  /agent <id>  /quit"
     );
 }
 
@@ -2504,6 +2615,106 @@ mod tests {
     }
 
     struct ScriptedApproval;
+
+    fn fixture_model(id: &str, context_window: usize) -> ModelInfo {
+        ModelInfo {
+            id: id.into(),
+            display_name: id.into(),
+            provider: "openai-codex".into(),
+            order: 0,
+            context_window,
+            default_effort: Some("medium".into()),
+            supported_efforts: vec!["low".into(), "medium".into(), "high".into()],
+            source: "fixture".into(),
+        }
+    }
+
+    #[test]
+    fn numbered_selection_accepts_number_exact_value_and_cancellation() {
+        let choices = vec!["alpha".into(), "beta".into()];
+        assert_eq!(
+            parse_numbered_selection("2", &choices).unwrap().as_deref(),
+            Some("beta")
+        );
+        assert_eq!(
+            parse_numbered_selection("alpha", &choices)
+                .unwrap()
+                .as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(parse_numbered_selection(" ", &choices).unwrap(), None);
+        assert!(parse_numbered_selection("0", &choices).is_err());
+        assert!(parse_numbered_selection("3", &choices).is_err());
+        assert!(parse_numbered_selection("unknown", &choices).is_err());
+    }
+
+    #[test]
+    fn effort_resolution_handles_auto_explicit_and_provider_controlled() {
+        let model = fixture_model("fixture", 10_000);
+        assert_eq!(
+            resolve_effort(&model, Some("auto")).unwrap().as_deref(),
+            Some("medium")
+        );
+        assert_eq!(
+            resolve_effort(&model, Some("high")).unwrap().as_deref(),
+            Some("high")
+        );
+        assert!(resolve_effort(&model, Some("minimal")).is_err());
+
+        let mut controlled = model;
+        controlled.default_effort = None;
+        controlled.supported_efforts.clear();
+        assert_eq!(resolve_effort(&controlled, Some("auto")).unwrap(), None);
+        assert!(resolve_effort(&controlled, Some("high")).is_err());
+    }
+
+    #[test]
+    fn model_and_effort_changes_update_session_selection() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let paths = VeraPaths::from_home(temp.path().join("home"))?;
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        let old = fixture_model("old", 8_000);
+        let mut session = SessionStore::new(paths).create_with_selection(
+            root,
+            CapabilitySelection {
+                provider: "openai-codex".into(),
+                model: old.id.clone(),
+                effort: Some("high".into()),
+                model_context_window: old.context_window,
+                ..CapabilitySelection::default()
+            },
+        )?;
+        let mut config = Config {
+            model: old.id.clone(),
+            effort: Some("high".into()),
+            ..Config::default()
+        };
+        let mut active = old;
+        let next = fixture_model("next", 32_000);
+
+        assert_eq!(
+            apply_model_selection(&mut config, &mut active, &mut session, next)?,
+            "medium"
+        );
+        assert_eq!(config.model, "next");
+        assert_eq!(config.effort.as_deref(), Some("auto"));
+        assert_eq!(session.selection.model, "next");
+        assert_eq!(session.selection.effort.as_deref(), Some("auto"));
+        assert_eq!(session.selection.model_context_window, 32_000);
+
+        assert_eq!(
+            apply_effort_selection(&mut config, &active, &mut session, "low")?,
+            "low"
+        );
+        assert_eq!(config.effort.as_deref(), Some("low"));
+        assert_eq!(session.selection.effort.as_deref(), Some("low"));
+
+        assert!(apply_effort_selection(&mut config, &active, &mut session, "unsupported").is_err());
+        assert_eq!(config.effort.as_deref(), Some("low"));
+        assert_eq!(session.selection.effort.as_deref(), Some("low"));
+        Ok(())
+    }
 
     #[test]
     fn upgrade_selects_highest_release_version_not_api_order() {
