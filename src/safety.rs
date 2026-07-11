@@ -829,6 +829,33 @@ mod tests {
     }
 
     #[test]
+    fn network_rules_can_match_the_specific_tool_and_command() {
+        let mut policy = PermissionPolicy::default();
+        policy.set_mode(PermissionMode::Yolo);
+        policy.add_global_rule(PermissionRule {
+            effect: PermissionEffect::Deny,
+            matcher: PermissionMatcher {
+                permission_kind: Some(PermissionKind::Network),
+                tool_name: Some("shell".into()),
+                command_prefix: Some("curl https://example.test".into()),
+                ..PermissionMatcher::default()
+            },
+        });
+        let denied = ActionSignature {
+            permission_kind: PermissionKind::Network,
+            tool_name: Some("shell".into()),
+            command_prefix: Some("curl   https://example.test --fail".into()),
+            ..ActionSignature::default()
+        };
+        let allowed = ActionSignature {
+            command_prefix: Some("curl https://other.test".into()),
+            ..denied.clone()
+        };
+        assert!(!policy.check_action(&denied));
+        assert!(policy.check_action(&allowed));
+    }
+
+    #[test]
     fn action_grants_are_narrower_than_permission_categories() {
         let mut policy = PermissionPolicy::default();
         policy.remember(PermissionKind::Shell, ApprovalChoice::Turn);

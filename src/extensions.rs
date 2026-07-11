@@ -401,8 +401,12 @@ impl HookRunner {
         mut session: Option<&mut Session>,
     ) -> Result<String> {
         policy
-            .authorize(
-                PermissionKind::Hook,
+            .authorize_action(
+                ActionSignature {
+                    permission_kind: PermissionKind::Hook,
+                    tool_name: Some(format!("hook:{}", spec.name)),
+                    ..ActionSignature::default()
+                },
                 &format!("run hook {}", spec.name),
                 approval,
                 session.as_deref_mut(),

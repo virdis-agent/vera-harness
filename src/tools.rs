@@ -1387,8 +1387,13 @@ impl Tool for Shell {
         if network {
             context
                 .policy
-                .authorize(
-                    PermissionKind::Network,
+                .authorize_action(
+                    ActionSignature {
+                        permission_kind: PermissionKind::Network,
+                        tool_name: Some("shell".into()),
+                        command_prefix: Some(normalize_command_prefix(command)),
+                        ..ActionSignature::default()
+                    },
                     "run a network-enabled shell command",
                     context.approval,
                     context.session.as_deref_mut(),
@@ -1535,8 +1540,12 @@ async fn provider_search(
         .context("missing query")?;
     context
         .policy
-        .authorize(
-            PermissionKind::Network,
+        .authorize_action(
+            ActionSignature {
+                permission_kind: PermissionKind::Network,
+                tool_name: Some(name.into()),
+                ..ActionSignature::default()
+            },
             &format!("use provider-native {name} for {query}"),
             context.approval,
             context.session.as_deref_mut(),
@@ -1559,7 +1568,7 @@ impl Tool for WebSearch {
     }
 
     async fn call(&self, context: ToolContext<'_>, arguments: Value) -> Result<ToolResult> {
-        provider_search("web", context, arguments).await
+        provider_search("web_search", context, arguments).await
     }
 }
 
@@ -1574,7 +1583,7 @@ impl Tool for XSearch {
     }
 
     async fn call(&self, context: ToolContext<'_>, arguments: Value) -> Result<ToolResult> {
-        provider_search("X", context, arguments).await
+        provider_search("x_search", context, arguments).await
     }
 }
 
@@ -1641,8 +1650,14 @@ impl Tool for ProcessStart {
         if network {
             context
                 .policy
-                .authorize(
-                    PermissionKind::Network,
+                .authorize_action(
+                    ActionSignature {
+                        permission_kind: PermissionKind::Network,
+                        tool_name: Some("process_start".into()),
+                        command_prefix: Some(normalize_command_prefix(command)),
+                        canonical_path: Some(cwd.clone()),
+                        ..ActionSignature::default()
+                    },
                     &format!("allow network for background process {command}"),
                     context.approval,
                     context.session.as_deref_mut(),

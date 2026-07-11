@@ -1220,6 +1220,7 @@ async fn run_interactive(
         &mut approval,
     )
     .await?;
+    let mut ctrl_c_pending = false;
     loop {
         let skill_snapshot = skills.lock().await.clone();
         let context = build_context(root, None, &skill_snapshot)?;
@@ -1290,7 +1291,7 @@ async fn run_interactive(
             context_estimated: !session.context_display().1,
             mode: policy.mode(),
         })?;
-        let line = match read_input()? {
+        let line = match read_input(&mut ctrl_c_pending)? {
             InputAction::CycleMode => {
                 policy.cycle_mode();
                 continue;

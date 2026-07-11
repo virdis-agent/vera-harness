@@ -4,7 +4,7 @@ set -eu
 # Public install command:
 # curl -fsSL https://raw.githubusercontent.com/virdis-agent/vera-harness/main/packaging/install.sh | sh
 
-VERSION="${VERA_VERSION:-0.1.0-alpha.5}"
+VERSION="${VERA_VERSION:-0.1.0-alpha.8}"
 REPO="${VERA_REPO:-virdis-agent/vera-harness}"
 API_URL="https://api.github.com/repos/${REPO}"
 OS="$(uname -s)"
