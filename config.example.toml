@@ -1,11 +1,35 @@
+version = 2
 provider = "openai-codex"
-model = "gpt-5.6"
+model = "auto"
+# Optional: auto uses the selected model's catalog default.
+# effort = "high"
 shell_timeout_seconds = 120
 context_window_tokens = 128000
+enabled_plugins = []
+enabled_mcp = []
+allowed_skills = []
+prompt_roots = []
+browser_cdp_endpoints = []
+# role = "reviewer"
+# hooks = ["./scripts/vera-hook.zsh"]
+
+# Ordered permission rules. A canonical_path is resolved against the project
+# root for project config (or ~/.vera for global config).
+# [[permission_rules]]
+# effect = "deny"
+# [permission_rules.matcher]
+# permission_kind = "shell"
+# command_prefix = "git reset"
+#
+# [[permission_rules]]
+# effect = "allow"
+# [permission_rules.matcher]
+# permission_kind = "browser"
+# browser_action = "connect"
+# network_host = "127.0.0.1"
 
 [approval]
 auto_read = true
 writes = "once"
 shell = "once"
 network = "once"
-

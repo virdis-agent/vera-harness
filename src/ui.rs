@@ -20,10 +20,13 @@ pub struct Dashboard<'a> {
     pub prompts: &'a [String],
     pub extensions: &'a [String],
     pub mcp_servers: usize,
+    pub mcp_available: usize,
     pub provider: &'a str,
     pub model: &'a str,
+    pub effort: &'a str,
     pub context_tokens: usize,
     pub context_limit: usize,
+    pub context_estimated: bool,
     pub mode: PermissionMode,
 }
 
@@ -114,8 +117,9 @@ pub fn render_dashboard(dashboard: &Dashboard<'_>) -> Result<DashboardFrame> {
     println!(
         "{}",
         format!(
-            "MCP: {} server{} connected",
+            "MCP: {}/{} server{} active",
             dashboard.mcp_servers,
+            dashboard.mcp_available,
             if dashboard.mcp_servers == 1 { "" } else { "s" }
         )
         .with(TEAL)
@@ -129,12 +133,21 @@ pub fn render_dashboard(dashboard: &Dashboard<'_>) -> Result<DashboardFrame> {
     } else {
         dashboard.context_tokens as f64 / dashboard.context_limit as f64 * 100.0
     };
+    let estimate = if dashboard.context_estimated {
+        "estimated"
+    } else {
+        "provider"
+    };
     let footer_left = format!(
-        "$0.000 (sub)  {:.1}%/{}k (auto)",
-        percent,
-        dashboard.context_limit / 1_000
+        "$0.000 (sub)  {}/{}k ({estimate}, {:.1}%)",
+        dashboard.context_tokens,
+        dashboard.context_limit / 1_000,
+        percent
     );
-    let footer_right = format!("({}) {} • high", dashboard.provider, dashboard.model);
+    let footer_right = format!(
+        "({}) {} • {}",
+        dashboard.provider, dashboard.model, dashboard.effort
+    );
     let footer_gap = width.saturating_sub(footer_left.len() + footer_right.len());
     let footer_line = format!("{}{}{}", footer_left, " ".repeat(footer_gap), footer_right);
     let interactive = stdout.is_terminal();
@@ -187,12 +200,12 @@ fn draw_decorations(
     if colored {
         println!("{}", line.with(BORDER));
         println!("{}", footer_line.with(MUTED));
-        print!("{} ", format!("MCP: {mcp_servers}/4 servers").with(TEAL));
+        print!("{} ", format!("MCP: {mcp_servers} active").with(TEAL));
         println!("{}", format!("⏵ {}", mode.label()).with(GOLD));
     } else {
         println!("{line}");
         println!("{footer_line}");
-        println!("MCP: {mcp_servers}/4 servers ⏵ {}", mode.label());
+        println!("MCP: {mcp_servers} active ⏵ {}", mode.label());
     }
 }
 

@@ -3,4 +3,6 @@ complete -c vera -s p -l prompt -r -d 'headless prompt'
 complete -c vera -l output -r -a 'text jsonl'
 complete -c vera -l provider -r -a 'openai-codex xai-oauth'
 complete -c vera -l model -r -d 'model id'
-
+complete -c vera -l effort -r -a 'auto low medium high'
+complete -c vera -l prompt-template -r -d 'reusable prompt name'
+complete -c vera -l prompt-args -r -d 'reusable prompt arguments'

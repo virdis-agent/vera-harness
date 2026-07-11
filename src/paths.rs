@@ -14,6 +14,8 @@ pub struct VeraPaths {
     pub sessions: PathBuf,
     pub plugins: PathBuf,
     pub skills: PathBuf,
+    pub prompts: PathBuf,
+    pub roles: PathBuf,
     pub logs: PathBuf,
 }
 
@@ -32,6 +34,8 @@ impl VeraPaths {
             sessions: root.join("sessions"),
             plugins: root.join("plugins"),
             skills: root.join("skills"),
+            prompts: root.join("prompts"),
+            roles: root.join("roles"),
             logs: root.join("logs"),
             root,
         })
@@ -42,6 +46,8 @@ impl VeraPaths {
         fs::create_dir_all(&self.sessions)?;
         fs::create_dir_all(&self.plugins)?;
         fs::create_dir_all(&self.skills)?;
+        fs::create_dir_all(&self.prompts)?;
+        fs::create_dir_all(&self.roles)?;
         fs::create_dir_all(&self.logs)?;
         set_mode(&self.root, 0o700)?;
         set_mode(&self.sessions, 0o700)?;

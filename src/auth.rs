@@ -17,6 +17,15 @@ use crate::paths::{VeraPaths, set_private_file};
 
 pub const OPENAI_ISSUER: &str = "https://auth.openai.com";
 pub const XAI_ISSUER: &str = "https://auth.x.ai";
+pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+pub const CODEX_DEVICE_USERCODE_URL: &str =
+    "https://auth.openai.com/api/accounts/deviceauth/usercode";
+pub const CODEX_DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
+pub const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+pub const XAI_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
+pub const XAI_DEVICE_CODE_URL: &str = "https://auth.x.ai/oauth2/device/code";
+pub const XAI_DISCOVERY_URL: &str = "https://auth.x.ai/.well-known/openid-configuration";
+pub const XAI_SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -50,6 +59,10 @@ pub struct TokenRecord {
     pub expires_at: Option<i64>,
     pub account_id: Option<String>,
     pub token_type: String,
+    /// The OIDC-discovered xAI token endpoint. Older auth records omit this
+    /// field and rediscover it before the next xAI refresh.
+    #[serde(default)]
+    pub xai_token_endpoint: Option<String>,
 }
 
 impl TokenRecord {
@@ -177,9 +190,14 @@ pub struct OAuthClient {
 pub struct DeviceAuthorization {
     pub device_code: String,
     pub user_code: String,
+    #[serde(alias = "verification_url", alias = "verification_uri_complete")]
     pub verification_uri: String,
     pub expires_in: u64,
     pub interval: u64,
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
+    #[serde(default)]
+    pub provider_data: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -189,6 +207,60 @@ struct OAuthTokenResponse {
     expires_in: Option<i64>,
     token_type: Option<String>,
     id_token: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct OpenaiDeviceAuthorization {
+    #[serde(alias = "device_code")]
+    device_auth_id: String,
+    user_code: String,
+    #[serde(
+        default,
+        alias = "verification_url",
+        alias = "verification_uri_complete"
+    )]
+    verification_uri: Option<String>,
+    #[serde(
+        default = "default_device_expiry",
+        deserialize_with = "deserialize_u64"
+    )]
+    expires_in: u64,
+    #[serde(
+        default = "default_poll_interval",
+        deserialize_with = "deserialize_u64"
+    )]
+    interval: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct OpenaiDeviceToken {
+    authorization_code: String,
+    #[serde(alias = "code_verifier")]
+    code_verifier: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct OidcDiscovery {
+    token_endpoint: String,
+}
+
+fn default_device_expiry() -> u64 {
+    900
+}
+
+fn default_poll_interval() -> u64 {
+    5
+}
+
+fn deserialize_u64<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+        .ok_or_else(|| serde::de::Error::custom("expected an integer or numeric string"))
 }
 
 impl OAuthClient {
@@ -206,17 +278,53 @@ impl OAuthClient {
         provider: AuthProvider,
         challenge: Option<&str>,
     ) -> Result<DeviceAuthorization> {
-        let (issuer, client_id, endpoint) = oauth_config(provider);
-        let mut form = vec![("client_id", client_id), ("scope", "openid offline_access")];
-        if let Some(challenge) = challenge {
-            form.push(("code_challenge", challenge));
+        match provider {
+            AuthProvider::OpenaiCodex => {
+                let response = self
+                    .http
+                    .post(CODEX_DEVICE_USERCODE_URL)
+                    .json(&serde_json::json!({"client_id": CODEX_CLIENT_ID}))
+                    .send()
+                    .await?;
+                ensure_origin(response.url(), OPENAI_ISSUER)?;
+                if !response.status().is_success() {
+                    return Err(VeraError::Auth(safe_response(response).await).into());
+                }
+                let device: OpenaiDeviceAuthorization = response.json().await?;
+                Ok(DeviceAuthorization {
+                    device_code: device.device_auth_id,
+                    user_code: device.user_code,
+                    verification_uri: device
+                        .verification_uri
+                        .unwrap_or_else(|| format!("{OPENAI_ISSUER}/codex/device")),
+                    expires_in: device.expires_in,
+                    interval: device.interval,
+                    token_endpoint: None,
+                    provider_data: None,
+                })
+            }
+            AuthProvider::XaiOauth => {
+                let token_endpoint = self.discover_xai_token_endpoint().await?;
+                let mut form = vec![("client_id", XAI_CLIENT_ID), ("scope", XAI_SCOPE)];
+                if let Some(challenge) = challenge {
+                    form.push(("code_challenge", challenge));
+                    form.push(("code_challenge_method", "S256"));
+                }
+                let response = self
+                    .http
+                    .post(XAI_DEVICE_CODE_URL)
+                    .form(&form)
+                    .send()
+                    .await?;
+                ensure_origin(response.url(), XAI_ISSUER)?;
+                if !response.status().is_success() {
+                    return Err(VeraError::Auth(safe_response(response).await).into());
+                }
+                let mut device: DeviceAuthorization = response.json().await?;
+                device.token_endpoint = Some(token_endpoint);
+                Ok(device)
+            }
         }
-        let response = self.http.post(endpoint).form(&form).send().await?;
-        ensure_origin(response.url(), issuer)?;
-        if !response.status().is_success() {
-            return Err(VeraError::Auth(safe_response(response).await).into());
-        }
-        Ok(response.json().await?)
     }
 
     pub async fn poll(
@@ -225,38 +333,92 @@ impl OAuthClient {
         device: &DeviceAuthorization,
         verifier: Option<&str>,
     ) -> Result<TokenRecord> {
-        let (issuer, client_id, endpoint) = oauth_config(provider);
-        let mut form = vec![
-            ("client_id", client_id),
-            ("device_code", device.device_code.as_str()),
-            ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-        ];
-        if let Some(verifier) = verifier {
-            form.push(("code_verifier", verifier));
+        match provider {
+            AuthProvider::OpenaiCodex => {
+                let response = self
+                    .http
+                    .post(CODEX_DEVICE_TOKEN_URL)
+                    .json(&serde_json::json!({
+                        "device_auth_id": device.device_code,
+                        "user_code": device.user_code,
+                    }))
+                    .send()
+                    .await?;
+                ensure_origin(response.url(), OPENAI_ISSUER)?;
+                if !response.status().is_success() {
+                    let error = oauth_poll_error(response)
+                        .await?
+                        .unwrap_or_else(|| "OAuth device authorization failed".into());
+                    return Err(VeraError::Auth(error).into());
+                }
+                let device_token: OpenaiDeviceToken = response.json().await?;
+                let response = self
+                    .http
+                    .post(CODEX_TOKEN_URL)
+                    .form(&[
+                        ("grant_type", "authorization_code"),
+                        ("client_id", CODEX_CLIENT_ID),
+                        ("code", device_token.authorization_code.as_str()),
+                        ("code_verifier", device_token.code_verifier.as_str()),
+                        (
+                            "redirect_uri",
+                            "https://auth.openai.com/deviceauth/callback",
+                        ),
+                    ])
+                    .send()
+                    .await?;
+                ensure_origin(response.url(), OPENAI_ISSUER)?;
+                if !response.status().is_success() {
+                    return Err(VeraError::Auth(safe_response(response).await).into());
+                }
+                token_record_from_response(provider, response.json().await?, None)
+            }
+            AuthProvider::XaiOauth => {
+                let endpoint = device.token_endpoint.as_deref().ok_or_else(|| {
+                    VeraError::Auth("xAI token endpoint was not discovered".into())
+                })?;
+                ensure_origin_url(endpoint, XAI_ISSUER)?;
+                let mut form = vec![
+                    ("client_id", XAI_CLIENT_ID),
+                    ("device_code", device.device_code.as_str()),
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ];
+                if let Some(verifier) = verifier {
+                    form.push(("code_verifier", verifier));
+                }
+                let response = self.http.post(endpoint).form(&form).send().await?;
+                ensure_origin(response.url(), XAI_ISSUER)?;
+                if !response.status().is_success() {
+                    let error = oauth_poll_error(response)
+                        .await?
+                        .unwrap_or_else(|| "OAuth device authorization failed".into());
+                    return Err(VeraError::Auth(error).into());
+                }
+                token_record_from_response(provider, response.json().await?, Some(endpoint.into()))
+            }
         }
-        let response = self.http.post(endpoint).form(&form).send().await?;
-        ensure_origin(response.url(), issuer)?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(VeraError::Auth(safe_response(response).await).into());
-        }
-        let token: OAuthTokenResponse = response.json().await?;
-        Ok(TokenRecord {
-            provider,
-            access_token: token.access_token,
-            refresh_token: token.refresh_token,
-            expires_at: token.expires_in.map(|seconds| now_seconds() + seconds),
-            account_id: token.id_token.as_deref().and_then(account_id_from_jwt),
-            token_type: token.token_type.unwrap_or_else(|| "Bearer".into()),
-        })
     }
 
     pub async fn refresh(&self, existing: &TokenRecord) -> Result<TokenRecord> {
-        let (issuer, client_id, endpoint) = oauth_config(existing.provider);
         let refresh_token = existing
             .refresh_token
             .as_deref()
             .ok_or_else(|| VeraError::Auth("provider did not return a refresh token".into()))?;
+        let (issuer, endpoint) = match existing.provider {
+            AuthProvider::OpenaiCodex => (OPENAI_ISSUER, CODEX_TOKEN_URL.to_owned()),
+            AuthProvider::XaiOauth => {
+                let endpoint = match existing.xai_token_endpoint.as_deref() {
+                    Some(endpoint) => endpoint.to_owned(),
+                    None => self.discover_xai_token_endpoint().await?,
+                };
+                ensure_origin_url(&endpoint, XAI_ISSUER)?;
+                (XAI_ISSUER, endpoint)
+            }
+        };
+        let client_id = match existing.provider {
+            AuthProvider::OpenaiCodex => CODEX_CLIENT_ID,
+            AuthProvider::XaiOauth => XAI_CLIENT_ID,
+        };
         let form = [
             ("client_id", client_id),
             ("refresh_token", refresh_token),
@@ -274,21 +436,33 @@ impl OAuthClient {
         if !status.is_success() {
             return Err(VeraError::Auth(safe_response(response).await).into());
         }
-        let token: OAuthTokenResponse = response.json().await?;
-        Ok(TokenRecord {
-            provider: existing.provider,
-            access_token: token.access_token,
-            refresh_token: token
+        token_record_from_response(
+            existing.provider,
+            response.json().await?,
+            existing.xai_token_endpoint.clone(),
+        )
+        .map(|mut token| {
+            token.refresh_token = token
                 .refresh_token
-                .or_else(|| existing.refresh_token.clone()),
-            expires_at: token.expires_in.map(|seconds| now_seconds() + seconds),
-            account_id: token
-                .id_token
-                .as_deref()
-                .and_then(account_id_from_jwt)
-                .or_else(|| existing.account_id.clone()),
-            token_type: token.token_type.unwrap_or_else(|| "Bearer".into()),
+                .or_else(|| existing.refresh_token.clone());
+            token.account_id = token.account_id.or_else(|| existing.account_id.clone());
+            token.expires_at = token.expires_at.or(existing.expires_at);
+            token.xai_token_endpoint = token
+                .xai_token_endpoint
+                .or_else(|| existing.xai_token_endpoint.clone());
+            token
         })
+    }
+
+    async fn discover_xai_token_endpoint(&self) -> Result<String> {
+        let response = self.http.get(XAI_DISCOVERY_URL).send().await?;
+        ensure_origin(response.url(), XAI_ISSUER)?;
+        if !response.status().is_success() {
+            return Err(VeraError::Auth(safe_response(response).await).into());
+        }
+        let discovery: OidcDiscovery = response.json().await?;
+        ensure_origin_url(&discovery.token_endpoint, XAI_ISSUER)?;
+        Ok(discovery.token_endpoint)
     }
 }
 
@@ -296,21 +470,6 @@ pub fn pkce_pair() -> (String, String) {
     let verifier = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let digest = Sha256::digest(verifier.as_bytes());
     (verifier, URL_SAFE_NO_PAD.encode(digest))
-}
-
-fn oauth_config(provider: AuthProvider) -> (&'static str, &'static str, &'static str) {
-    match provider {
-        AuthProvider::OpenaiCodex => (
-            OPENAI_ISSUER,
-            "codex-cli",
-            "https://auth.openai.com/oauth/device/code",
-        ),
-        AuthProvider::XaiOauth => (
-            XAI_ISSUER,
-            "grok-cli",
-            "https://auth.x.ai/oauth/device/code",
-        ),
-    }
 }
 
 fn ensure_origin(url: &reqwest::Url, issuer: &str) -> Result<()> {
@@ -322,6 +481,74 @@ fn ensure_origin(url: &reqwest::Url, issuer: &str) -> Result<()> {
         return Err(VeraError::Auth("OAuth origin pinning rejected response".into()).into());
     }
     Ok(())
+}
+
+fn ensure_origin_url(url: &str, issuer: &str) -> Result<()> {
+    let url = reqwest::Url::parse(url)
+        .map_err(|_| VeraError::Auth("OAuth discovery returned an invalid endpoint".into()))?;
+    ensure_origin(&url, issuer)
+}
+
+async fn oauth_poll_error(response: reqwest::Response) -> Result<Option<String>> {
+    if response.status().is_success() {
+        return Ok(None);
+    }
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
+    let error = parsed
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let description = parsed
+        .as_ref()
+        .and_then(|value| value.get("error_description"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let label = match error {
+        "authorization_pending" => "authorization pending",
+        "slow_down" => "slow_down",
+        "expired_token" | "expired_device_code" => "device authorization expired",
+        _ if status == StatusCode::TOO_MANY_REQUESTS => "rate limited",
+        _ if status == StatusCode::FORBIDDEN || status == StatusCode::NOT_FOUND => {
+            "authorization pending"
+        }
+        _ => "OAuth device authorization failed",
+    };
+    if matches!(error, "authorization_pending" | "slow_down")
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::FORBIDDEN
+        || status == StatusCode::NOT_FOUND
+    {
+        return Ok(Some(label.into()));
+    }
+    let detail = if description.is_empty() {
+        label.to_owned()
+    } else {
+        format!("{label}: {}", redact(description))
+    };
+    Ok(Some(detail))
+}
+
+fn token_record_from_response(
+    provider: AuthProvider,
+    token: OAuthTokenResponse,
+    xai_token_endpoint: Option<String>,
+) -> Result<TokenRecord> {
+    Ok(TokenRecord {
+        provider,
+        access_token: token.access_token.clone(),
+        refresh_token: token.refresh_token,
+        expires_at: token.expires_in.map(|seconds| now_seconds() + seconds),
+        account_id: token
+            .id_token
+            .as_deref()
+            .and_then(account_id_from_jwt)
+            .or_else(|| account_id_from_jwt(&token.access_token)),
+        token_type: token.token_type.unwrap_or_else(|| "Bearer".into()),
+        xai_token_endpoint,
+    })
 }
 
 async fn safe_response(response: reqwest::Response) -> String {
@@ -339,15 +566,25 @@ pub fn redact(text: &str) -> String {
         "client_secret",
         "Authorization",
     ] {
-        if let Some(index) = value.to_ascii_lowercase().find(&key.to_ascii_lowercase()) {
+        let key = key.to_ascii_lowercase();
+        let mut cursor = 0;
+        while cursor < value.len() {
+            let lower = value.to_ascii_lowercase();
+            let Some(relative) = lower[cursor..].find(&key) else {
+                break;
+            };
+            let index = cursor + relative;
             let tail = &value[index..];
-            if let Some(colon) = tail.find(':') {
-                let start = index + colon + 1;
-                let end = value[start..]
-                    .find([',', '}', '\n'])
-                    .map_or(value.len(), |offset| start + offset);
-                value.replace_range(start..end, " \"[REDACTED]\"");
-            }
+            let Some(colon) = tail.find(':') else {
+                cursor = index.saturating_add(key.len());
+                continue;
+            };
+            let start = index + colon + 1;
+            let end = value[start..]
+                .find([',', '}', '\n'])
+                .map_or(value.len(), |offset| start + offset);
+            value.replace_range(start..end, " \"[REDACTED]\"");
+            cursor = start + " \"[REDACTED]\"".len();
         }
     }
     value
@@ -360,10 +597,28 @@ fn account_id_from_jwt(jwt: &str) -> Option<String> {
         .ok()
         .or_else(|| STANDARD.decode(payload).ok())?;
     let json: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
-    json.get("chatgpt_account_id")
-        .or_else(|| json.get("account_id"))
-        .and_then(|value| value.as_str())
-        .map(str::to_owned)
+    fn find(value: &serde_json::Value) -> Option<String> {
+        if let Some(object) = value.as_object() {
+            for key in ["chatgpt_account_id", "account_id"] {
+                if let Some(value) = object.get(key).and_then(serde_json::Value::as_str) {
+                    return Some(value.to_owned());
+                }
+            }
+            for value in object.values() {
+                if let Some(found) = find(value) {
+                    return Some(found);
+                }
+            }
+        } else if let Some(values) = value.as_array() {
+            for value in values {
+                if let Some(found) = find(value) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    find(&json)
 }
 
 pub fn now_seconds() -> i64 {
@@ -380,6 +635,9 @@ mod tests {
     #[test]
     fn redacts_secrets() {
         assert!(!redact(r#"{"access_token":"secret"}"#).contains("secret"));
+        let repeated = redact(r#"{"access_token":"first","nested":{"access_token":"second"}}"#);
+        assert!(!repeated.contains("first"));
+        assert!(!repeated.contains("second"));
     }
 
     #[test]
@@ -387,6 +645,31 @@ mod tests {
         let (verifier, challenge) = pkce_pair();
         assert!(!verifier.is_empty());
         assert!(!challenge.contains('='));
+    }
+
+    #[test]
+    fn extracts_nested_chatgpt_account_id_claim() {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+        let payload = URL_SAFE_NO_PAD
+            .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct_nested"}}"#);
+        let jwt = format!("{header}.{payload}.");
+        assert_eq!(account_id_from_jwt(&jwt).as_deref(), Some("acct_nested"));
+    }
+
+    #[test]
+    fn legacy_token_records_default_discovered_endpoint_to_none() {
+        let record: TokenRecord = serde_json::from_str(
+            r#"{
+                "provider":"openai-codex",
+                "access_token":"access",
+                "refresh_token":"refresh",
+                "expires_at":null,
+                "account_id":null,
+                "token_type":"Bearer"
+            }"#,
+        )
+        .unwrap();
+        assert!(record.xai_token_endpoint.is_none());
     }
 
     #[test]
@@ -402,6 +685,7 @@ mod tests {
                 expires_at: Some(now_seconds() + 10_000),
                 account_id: Some("account".into()),
                 token_type: "Bearer".into(),
+                xai_token_endpoint: None,
             })
             .unwrap();
         assert_eq!(

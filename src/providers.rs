@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -6,10 +8,12 @@ use futures_util::StreamExt;
 use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::auth::{AuthProvider, TokenRecord};
 use crate::error::VeraError;
 use crate::events::{Event, EventSink};
+use crate::paths::{VeraPaths, set_private_file};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -47,6 +51,139 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProviderInput {
+    Message {
+        role: String,
+        content: String,
+    },
+    ImageMessage {
+        role: String,
+        text: String,
+        mime_type: String,
+        data_base64: String,
+    },
+    FunctionCall {
+        id: String,
+        name: String,
+        arguments: String,
+    },
+    FunctionCallOutput {
+        call_id: String,
+        output: String,
+    },
+}
+
+impl ProviderInput {
+    pub fn message(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self::Message {
+            role: role.into(),
+            content: content.into(),
+        }
+    }
+
+    pub fn image_message(
+        role: impl Into<String>,
+        text: impl Into<String>,
+        mime_type: impl Into<String>,
+        data_base64: impl Into<String>,
+    ) -> Self {
+        Self::ImageMessage {
+            role: role.into(),
+            text: text.into(),
+            mime_type: mime_type.into(),
+            data_base64: data_base64.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ReasoningEffortInfo {
+    #[serde(default)]
+    pub default: Option<String>,
+    #[serde(default)]
+    pub supported: Vec<String>,
+}
+
+impl ReasoningEffortInfo {
+    pub fn fixed() -> Self {
+        Self {
+            default: None,
+            supported: Vec::new(),
+        }
+    }
+
+    pub fn configurable(default: impl Into<String>, supported: &[&str]) -> Self {
+        Self {
+            default: Some(default.into()),
+            supported: supported.iter().map(|value| (*value).into()).collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct ModelInfo {
+    pub id: String,
+    #[serde(default)]
+    pub display_name: String,
+    pub provider: String,
+    #[serde(default)]
+    pub order: i32,
+    pub context_window: usize,
+    #[serde(default)]
+    pub default_effort: Option<String>,
+    #[serde(default)]
+    pub supported_efforts: Vec<String>,
+    pub source: String,
+}
+
+impl ModelInfo {
+    pub fn effort_info(&self) -> ReasoningEffortInfo {
+        ReasoningEffortInfo {
+            default: self.default_effort.clone(),
+            supported: self.supported_efforts.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ModelCatalog {
+    pub models: BTreeMap<String, Vec<ModelInfo>>,
+}
+
+impl ModelCatalog {
+    pub fn for_provider(&self, provider: ProviderKind) -> &[ModelInfo] {
+        self.models
+            .get(provider.as_str())
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn find(&self, provider: ProviderKind, id: &str) -> Option<&ModelInfo> {
+        self.for_provider(provider)
+            .iter()
+            .find(|model| model.id == id)
+    }
+
+    pub fn default_for(&self, provider: ProviderKind) -> Option<&ModelInfo> {
+        self.for_provider(provider)
+            .iter()
+            .min_by_key(|model| (model.order, model.id.as_str()))
+    }
+
+    pub fn merge(&mut self, models: impl IntoIterator<Item = ModelInfo>) {
+        for model in models {
+            let entries = self.models.entry(model.provider.clone()).or_default();
+            if let Some(existing) = entries.iter_mut().find(|entry| entry.id == model.id) {
+                *existing = model;
+            } else {
+                entries.push(model);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolSchema {
     pub name: String,
@@ -57,9 +194,10 @@ pub struct ToolSchema {
 #[derive(Clone, Debug)]
 pub struct ProviderRequest {
     pub model: String,
-    pub messages: Vec<ChatMessage>,
+    pub input: Vec<ProviderInput>,
     pub tools: Vec<ToolSchema>,
     pub instructions: String,
+    pub effort: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -72,14 +210,18 @@ pub struct ProviderResult {
 #[async_trait]
 pub trait Provider: Send + Sync {
     fn kind(&self) -> ProviderKind;
+    fn supports_image_input(&self) -> bool {
+        false
+    }
     async fn stream(
         &self,
         request: ProviderRequest,
         sink: &mut dyn EventSink,
     ) -> Result<ProviderResult>;
-    async fn models(&self) -> Result<Vec<String>>;
+    async fn models(&self) -> Result<ModelCatalog>;
 }
 
+#[derive(Clone)]
 pub struct ResponsesProvider {
     kind: ProviderKind,
     token: TokenRecord,
@@ -107,18 +249,53 @@ impl ResponsesProvider {
 
     fn model_endpoint(&self) -> &'static str {
         match self.kind {
-            ProviderKind::OpenaiCodex => "https://chatgpt.com/backend-api/models",
-            ProviderKind::XaiOauth => "https://api.x.ai/v1/models",
+            ProviderKind::OpenaiCodex => "https://chatgpt.com/backend-api/codex/models",
+            ProviderKind::XaiOauth => "https://api.x.ai/v1/language-models",
         }
     }
 
     fn body(&self, request: &ProviderRequest) -> Value {
         let input: Vec<Value> = request
-            .messages
+            .input
             .iter()
-            .map(|message| json!({"role": message.role, "content": message.content}))
+            .map(|item| match item {
+                ProviderInput::Message { role, content } => {
+                    json!({"role":role,"content":content})
+                }
+                ProviderInput::ImageMessage {
+                    role,
+                    text,
+                    mime_type,
+                    data_base64,
+                } => json!({
+                    "role": role,
+                    "content": [
+                        {"type":"input_text","text":text},
+                        {"type":"input_image","image_url":format!("data:{mime_type};base64,{data_base64}")}
+                    ]
+                }),
+                ProviderInput::FunctionCall {
+                    id,
+                    name,
+                    arguments,
+                } => {
+                    json!({"type":"function_call","id":id,"name":name,"arguments":arguments})
+                }
+                ProviderInput::FunctionCallOutput { call_id, output } => {
+                    json!({"type":"function_call_output","call_id":call_id,"output":output})
+                }
+            })
             .collect();
-        let mut body = json!({"model": request.model, "instructions": request.instructions, "input": input, "stream": true});
+        let mut body = json!({
+            "model": request.model,
+            "instructions": request.instructions,
+            "input": input,
+            "stream": true,
+            "store": false
+        });
+        if let Some(effort) = &request.effort {
+            body["reasoning"] = json!({"effort": effort});
+        }
         if !request.tools.is_empty() {
             body["tools"] = Value::Array(
                 request
@@ -134,6 +311,13 @@ impl ResponsesProvider {
         }
         body
     }
+
+    pub fn supports_image_input(&self) -> bool {
+        matches!(
+            self.kind,
+            ProviderKind::OpenaiCodex | ProviderKind::XaiOauth
+        )
+    }
 }
 
 #[async_trait]
@@ -142,11 +326,23 @@ impl Provider for ResponsesProvider {
         self.kind
     }
 
+    fn supports_image_input(&self) -> bool {
+        true
+    }
+
     async fn stream(
         &self,
         request: ProviderRequest,
         sink: &mut dyn EventSink,
     ) -> Result<ProviderResult> {
+        if request
+            .input
+            .iter()
+            .any(|input| matches!(input, ProviderInput::ImageMessage { .. }))
+            && !Provider::supports_image_input(self)
+        {
+            return Err(VeraError::Provider("provider does not support image input".into()).into());
+        }
         let mut builder = self
             .http
             .post(self.endpoint())
@@ -156,7 +352,15 @@ impl Provider for ResponsesProvider {
         if let Some(account_id) = &self.token.account_id {
             builder = builder.header("chatgpt-account-id", account_id);
         }
+        if self.kind == ProviderKind::OpenaiCodex {
+            builder = builder.header("originator", "codex_cli_rs");
+        }
         let response = builder.send().await.context("provider request")?;
+        let expected_origin = match self.kind {
+            ProviderKind::OpenaiCodex => "https://chatgpt.com",
+            ProviderKind::XaiOauth => "https://api.x.ai",
+        };
+        ensure_provider_origin(response.url(), expected_origin)?;
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             return Err(VeraError::Provider(
                 "provider rejected credentials; retry after refresh".into(),
@@ -199,13 +403,18 @@ impl Provider for ResponsesProvider {
         Ok(result)
     }
 
-    async fn models(&self) -> Result<Vec<String>> {
+    async fn models(&self) -> Result<ModelCatalog> {
         let response = self
             .http
             .get(self.model_endpoint())
             .bearer_auth(&self.token.access_token)
             .send()
             .await?;
+        let expected_origin = match self.kind {
+            ProviderKind::OpenaiCodex => "https://chatgpt.com",
+            ProviderKind::XaiOauth => "https://api.x.ai",
+        };
+        ensure_provider_origin(response.url(), expected_origin)?;
         if !response.status().is_success() {
             return Err(VeraError::Provider(format!(
                 "model discovery returned {}",
@@ -214,13 +423,13 @@ impl Provider for ResponsesProvider {
             .into());
         }
         let body: Value = response.json().await?;
-        Ok(body
-            .get("data")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|item| item.get("id").and_then(Value::as_str).map(str::to_owned))
-            .collect())
+        let models = match self.kind {
+            ProviderKind::OpenaiCodex => parse_openai_models(&body)?,
+            ProviderKind::XaiOauth => parse_xai_models(&body)?,
+        };
+        Ok(ModelCatalog {
+            models: BTreeMap::from([(self.kind.as_str().into(), models)]),
+        })
     }
 }
 
@@ -345,16 +554,241 @@ pub fn normalize_response_event(payload: &str) -> Vec<Event> {
     }
 }
 
+/// Legacy callers can still ask for a catalog-shaped provider map, but Vera
+/// no longer invents model IDs when the provider has not been discovered.
 pub fn provider_catalog() -> BTreeMap<&'static str, Vec<&'static str>> {
-    BTreeMap::from([
-        ("openai-codex", vec!["gpt-5.6"]),
-        ("xai-oauth", vec!["grok-4.5"]),
-    ])
+    BTreeMap::new()
+}
+
+fn ensure_provider_origin(url: &reqwest::Url, expected: &str) -> Result<()> {
+    let expected = reqwest::Url::parse(expected)?;
+    if url.scheme() != expected.scheme()
+        || url.host_str() != expected.host_str()
+        || url.port_or_known_default() != expected.port_or_known_default()
+    {
+        anyhow::bail!("provider origin pinning rejected response")
+    }
+    Ok(())
+}
+
+fn model_array<'a>(body: &'a Value, key: &str) -> Result<&'a [Value]> {
+    body.get(key)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .ok_or_else(|| anyhow::anyhow!("model catalog response is missing {key}"))
+}
+
+pub fn parse_openai_models(body: &Value) -> Result<Vec<ModelInfo>> {
+    let models = body
+        .get("models")
+        .and_then(Value::as_array)
+        .or_else(|| body.get("data").and_then(Value::as_array))
+        .or_else(|| body.as_array())
+        .ok_or_else(|| anyhow::anyhow!("OpenAI model catalog response is missing models"))?;
+    let mut parsed = models
+        .iter()
+        .filter_map(|item| {
+            let id = item
+                .get("slug")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)?
+                .trim();
+            if id.is_empty() || item.get("supported_in_api").and_then(Value::as_bool) == Some(false)
+            {
+                return None;
+            }
+            let supported = item
+                .get("supported_reasoning_levels")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let default_effort = item
+                .get("default_reasoning_level")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            Some(ModelInfo {
+                id: id.to_owned(),
+                display_name: item
+                    .get("display_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(id)
+                    .to_owned(),
+                provider: ProviderKind::OpenaiCodex.as_str().into(),
+                order: item.get("priority").and_then(Value::as_i64).unwrap_or(0) as i32,
+                context_window: item
+                    .get("context_window")
+                    .or_else(|| item.get("context_window_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(128_000) as usize,
+                default_effort,
+                supported_efforts: supported,
+                source: "live".into(),
+            })
+        })
+        .collect::<Vec<_>>();
+    parsed.sort_by_key(|model| (model.order, model.id.clone()));
+    Ok(parsed)
+}
+
+pub fn parse_xai_models(body: &Value) -> Result<Vec<ModelInfo>> {
+    let models = model_array(body, "models")?;
+    let mut parsed = models
+        .iter()
+        .filter_map(|item| {
+            let id = item.get("id").and_then(Value::as_str)?.trim();
+            if id.is_empty() {
+                return None;
+            }
+            let input_text = item
+                .get("input_modalities")
+                .and_then(Value::as_array)
+                .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("text")));
+            let output_text = item
+                .get("output_modalities")
+                .and_then(Value::as_array)
+                .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("text")));
+            if !input_text || !output_text {
+                return None;
+            }
+            let effort = xai_effort_info(id);
+            Some(ModelInfo {
+                id: id.to_owned(),
+                display_name: id.to_owned(),
+                provider: ProviderKind::XaiOauth.as_str().into(),
+                order: item
+                    .get("created")
+                    .and_then(Value::as_i64)
+                    .map(|v| -(v as i32))
+                    .unwrap_or(0),
+                context_window: item
+                    .get("context_length")
+                    .or_else(|| item.get("context_window"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(128_000) as usize,
+                default_effort: effort.default,
+                supported_efforts: effort.supported,
+                source: "live".into(),
+            })
+        })
+        .collect::<Vec<_>>();
+    parsed.sort_by_key(|model| (model.order, model.id.clone()));
+    Ok(parsed)
+}
+
+/// xAI's language-model endpoint advertises IDs and modalities, but not the
+/// adjustable reasoning capability. Keep this small, explicit map in sync
+/// with the documented Responses API contract; unknown IDs omit reasoning.
+pub fn xai_effort_info(model_id: &str) -> ReasoningEffortInfo {
+    let id = model_id.to_ascii_lowercase();
+    if [
+        "grok-4.5",
+        "grok-4.5-fast",
+        "grok-4.3",
+        "grok-4.3-fast",
+        "grok-4.1",
+        "grok-4.1-fast",
+        "grok-4-1-fast-reasoning",
+        "grok-3-mini",
+        "grok-3-mini-fast",
+    ]
+    .iter()
+    .any(|known| id == *known)
+    {
+        return ReasoningEffortInfo::configurable("high", &["low", "medium", "high"]);
+    }
+    ReasoningEffortInfo::fixed()
+}
+
+pub fn load_cached_models(paths: &VeraPaths, provider: ProviderKind) -> Result<Vec<ModelInfo>> {
+    let path = paths
+        .root
+        .join(format!("models-{}.json", provider.as_str()));
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let bytes = fs::read(path)?;
+    if let Ok(catalog) = serde_json::from_slice::<ModelCatalog>(&bytes) {
+        return Ok(catalog
+            .models
+            .get(provider.as_str())
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|mut model| {
+                model.source = "cached".into();
+                model
+            })
+            .collect());
+    }
+    Ok(serde_json::from_slice::<Vec<ModelInfo>>(&bytes)?
+        .into_iter()
+        .map(|mut model| {
+            model.source = "cached".into();
+            model
+        })
+        .collect())
+}
+
+pub fn cache_models(paths: &VeraPaths, provider: ProviderKind, models: &[ModelInfo]) -> Result<()> {
+    paths.ensure_runtime_dirs()?;
+    let path = paths
+        .root
+        .join(format!("models-{}.json", provider.as_str()));
+    let temporary = paths.root.join(format!(
+        "models-{}.{}.tmp",
+        provider.as_str(),
+        Uuid::new_v4()
+    ));
+    let mut output = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)?;
+    set_private_file(&temporary)?;
+    output.write_all(&serde_json::to_vec_pretty(models)?)?;
+    output.sync_all()?;
+    fs::rename(temporary, &path)?;
+    set_private_file(&path)?;
+    Ok(())
+}
+
+pub fn cache_catalog(
+    paths: &VeraPaths,
+    provider: ProviderKind,
+    catalog: &ModelCatalog,
+) -> Result<()> {
+    cache_models(paths, provider, catalog.for_provider(provider))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TextOnlyFixture;
+
+    #[async_trait]
+    impl Provider for TextOnlyFixture {
+        fn kind(&self) -> ProviderKind {
+            ProviderKind::XaiOauth
+        }
+
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+            _sink: &mut dyn EventSink,
+        ) -> Result<ProviderResult> {
+            Ok(ProviderResult::default())
+        }
+
+        async fn models(&self) -> Result<ModelCatalog> {
+            Ok(ModelCatalog::default())
+        }
+    }
 
     #[test]
     fn fragmented_sse_frames_are_reassembled() {
@@ -393,5 +827,136 @@ mod tests {
             normalize_response_event("not-json").first(),
             Some(Event::Error { code, .. }) if code == "malformed_event"
         ));
+    }
+
+    #[test]
+    fn parses_openai_reasoning_metadata_and_priority() {
+        let body = serde_json::json!({
+            "models": [
+                {"slug":"slow","display_name":"Slow","priority":20,"default_reasoning_level":"high","supported_reasoning_levels":["low","high"]},
+                {"slug":"fast","display_name":"Fast","priority":1,"context_window":64000,"default_reasoning_level":"minimal","supported_reasoning_levels":["minimal","low"]}
+            ]
+        });
+        let models = parse_openai_models(&body).unwrap();
+        assert_eq!(models[0].id, "fast");
+        assert_eq!(models[0].display_name, "Fast");
+        assert_eq!(models[0].context_window, 64_000);
+        assert_eq!(models[0].default_effort.as_deref(), Some("minimal"));
+        assert_eq!(models[0].supported_efforts, ["minimal", "low"]);
+    }
+
+    #[test]
+    fn filters_xai_to_text_models_and_omits_unknown_effort() {
+        let body = serde_json::json!({
+            "models": [
+                {"id":"grok-4.5","input_modalities":["text"],"output_modalities":["text"]},
+                {"id":"grok-imagine-image","input_modalities":["text"],"output_modalities":["image"]},
+                {"id":"future-grok","input_modalities":["text"],"output_modalities":["text"]}
+            ]
+        });
+        let models = parse_xai_models(&body).unwrap();
+        assert_eq!(models.len(), 2);
+        let known = models.iter().find(|model| model.id == "grok-4.5").unwrap();
+        assert_eq!(known.supported_efforts, ["low", "medium", "high"]);
+        let unknown = models
+            .iter()
+            .find(|model| model.id == "future-grok")
+            .unwrap();
+        assert!(unknown.supported_efforts.is_empty());
+        assert!(unknown.default_effort.is_none());
+    }
+
+    #[test]
+    fn request_body_sets_store_false_and_only_explicit_reasoning() {
+        let provider = ResponsesProvider::new(
+            ProviderKind::XaiOauth,
+            TokenRecord {
+                provider: AuthProvider::XaiOauth,
+                access_token: "access".into(),
+                refresh_token: None,
+                expires_at: None,
+                account_id: None,
+                token_type: "Bearer".into(),
+                xai_token_endpoint: None,
+            },
+        )
+        .unwrap();
+        let request = ProviderRequest {
+            model: "grok-4.5".into(),
+            input: vec![ProviderInput::message("user", "hello")],
+            tools: Vec::new(),
+            instructions: "instructions".into(),
+            effort: Some("low".into()),
+        };
+        let body = provider.body(&request);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["reasoning"]["effort"], "low");
+
+        let mut fixed = request;
+        fixed.model = "future-grok".into();
+        fixed.effort = None;
+        assert!(fixed.effort.is_none());
+        assert!(provider.body(&fixed).get("reasoning").is_none());
+    }
+
+    #[test]
+    fn cached_catalog_is_atomic_and_labeled() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = VeraPaths::from_home(temp.path().join("home")).unwrap();
+        let model = ModelInfo {
+            id: "grok-4.5".into(),
+            display_name: "Grok 4.5".into(),
+            provider: "xai-oauth".into(),
+            order: 0,
+            context_window: 128_000,
+            default_effort: Some("high".into()),
+            supported_efforts: vec!["low".into(), "medium".into(), "high".into()],
+            source: "live".into(),
+        };
+        cache_models(&paths, ProviderKind::XaiOauth, &[model]).unwrap();
+        let cached = load_cached_models(&paths, ProviderKind::XaiOauth).unwrap();
+        assert_eq!(cached[0].source, "cached");
+        assert!(paths.root.join("models-xai-oauth.json").is_file());
+    }
+
+    #[test]
+    fn image_inputs_use_provider_neutral_parts_and_data_urls() {
+        let provider = ResponsesProvider::new(
+            ProviderKind::XaiOauth,
+            TokenRecord {
+                provider: AuthProvider::XaiOauth,
+                access_token: "access".into(),
+                refresh_token: None,
+                expires_at: None,
+                account_id: None,
+                token_type: "Bearer".into(),
+                xai_token_endpoint: None,
+            },
+        )
+        .unwrap();
+        let request = ProviderRequest {
+            model: "grok-4.5".into(),
+            input: vec![ProviderInput::image_message(
+                "user",
+                "inspect",
+                "image/png",
+                "AA==",
+            )],
+            tools: Vec::new(),
+            instructions: String::new(),
+            effort: None,
+        };
+        let body = provider.body(&request);
+        assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
+        assert_eq!(
+            body["input"][0]["content"][1]["image_url"],
+            "data:image/png;base64,AA=="
+        );
+        assert!(provider.supports_image_input());
+    }
+
+    #[test]
+    fn text_only_provider_declares_image_capability_false() {
+        assert!(!TextOnlyFixture.supports_image_input());
     }
 }
