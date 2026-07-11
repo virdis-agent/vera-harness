@@ -4,10 +4,13 @@ use std::path::PathBuf;
 use anyhow::Result;
 use crossterm::{
     cursor::{self, MoveTo, RestorePosition, SavePosition},
+    event::{self, Event, KeyCode, KeyModifiers},
     execute,
     style::{Color, Stylize},
     terminal::{self, Clear, ClearType},
 };
+
+use crate::safety::PermissionMode;
 
 pub struct Dashboard<'a> {
     pub version: &'a str,
@@ -21,7 +24,7 @@ pub struct Dashboard<'a> {
     pub model: &'a str,
     pub context_tokens: usize,
     pub context_limit: usize,
-    pub plan_mode: bool,
+    pub mode: PermissionMode,
 }
 
 const TEAL: Color = Color::Rgb {
@@ -54,7 +57,7 @@ pub struct DashboardFrame {
     line: String,
     footer_line: String,
     mcp_servers: usize,
-    plan_mode: bool,
+    mode: PermissionMode,
     output_row: u16,
     interactive: bool,
 }
@@ -69,7 +72,7 @@ impl DashboardFrame {
                 &self.line,
                 &self.footer_line,
                 self.mcp_servers,
-                self.plan_mode,
+                self.mode,
                 false,
             );
         }
@@ -92,7 +95,7 @@ pub fn render_dashboard(dashboard: &Dashboard<'_>) -> Result<DashboardFrame> {
     );
     println!(
         "{}",
-        "ctrl+d exit · /commands for help · /compact context · /plan mode".with(MUTED)
+        "shift+tab switch mode · ctrl+d exit · /commands for help · /compact context".with(MUTED)
     );
     println!(
         "{}\n",
@@ -158,7 +161,7 @@ pub fn render_dashboard(dashboard: &Dashboard<'_>) -> Result<DashboardFrame> {
             &line,
             &footer_line,
             dashboard.mcp_servers,
-            dashboard.plan_mode,
+            dashboard.mode,
             true,
         );
         execute!(stdout, RestorePosition)?;
@@ -168,7 +171,7 @@ pub fn render_dashboard(dashboard: &Dashboard<'_>) -> Result<DashboardFrame> {
         line,
         footer_line,
         mcp_servers: dashboard.mcp_servers,
-        plan_mode: dashboard.plan_mode,
+        mode: dashboard.mode,
         output_row,
         interactive,
     })
@@ -178,28 +181,93 @@ fn draw_decorations(
     line: &str,
     footer_line: &str,
     mcp_servers: usize,
-    plan_mode: bool,
+    mode: PermissionMode,
     colored: bool,
 ) {
     if colored {
         println!("{}", line.with(BORDER));
         println!("{}", footer_line.with(MUTED));
         print!("{} ", format!("MCP: {mcp_servers}/4 servers").with(TEAL));
-        println!(
-            "{}",
-            if plan_mode {
-                "⏸ Plan".with(GOLD)
-            } else {
-                "⏵ Safe".with(GOLD)
-            }
-        );
+        println!("{}", format!("⏵ {}", mode.label()).with(GOLD));
     } else {
         println!("{line}");
         println!("{footer_line}");
         println!(
             "MCP: {mcp_servers}/4 servers {}",
-            if plan_mode { "⏸ Plan" } else { "⏵ Safe" }
+            format!("⏵ {}", mode.label())
         );
+    }
+}
+
+pub enum InputAction {
+    Submit(String),
+    CycleMode,
+    Cancel,
+    Exit,
+}
+
+pub fn read_input() -> Result<InputAction> {
+    let stdin = io::stdin();
+    if !stdin.is_terminal() || !io::stdout().is_terminal() {
+        let mut line = String::new();
+        if stdin.read_line(&mut line)? == 0 {
+            return Ok(InputAction::Exit);
+        }
+        return Ok(InputAction::Submit(line));
+    }
+
+    terminal::enable_raw_mode()?;
+    let result = read_raw_input();
+    terminal::disable_raw_mode()?;
+    result
+}
+
+fn read_raw_input() -> Result<InputAction> {
+    let mut stdout = io::stdout();
+    let mut input = String::new();
+    loop {
+        match event::read()? {
+            Event::Paste(text) => {
+                input.push_str(&text);
+                print!("{text}");
+                stdout.flush()?;
+            }
+            Event::Key(key) => match key.code {
+                KeyCode::BackTab => return Ok(InputAction::CycleMode),
+                KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    return Ok(InputAction::CycleMode);
+                }
+                KeyCode::Enter => {
+                    print!("\r\n");
+                    stdout.flush()?;
+                    return Ok(InputAction::Submit(input));
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    print!("^C\r\n");
+                    stdout.flush()?;
+                    return Ok(InputAction::Cancel);
+                }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    print!("\r\n");
+                    stdout.flush()?;
+                    return Ok(InputAction::Exit);
+                }
+                KeyCode::Char(character) => {
+                    input.push(character);
+                    print!("{character}");
+                    stdout.flush()?;
+                }
+                KeyCode::Backspace => {
+                    if input.pop().is_some() {
+                        print!("\x08 \x08");
+                        stdout.flush()?;
+                    }
+                }
+                KeyCode::Esc => return Ok(InputAction::Cancel),
+                _ => {}
+            },
+            _ => {}
+        }
     }
 }
 

@@ -33,6 +33,47 @@ impl PermissionKind {
             Self::Write | Self::Shell | Self::Hook | Self::Plugin | Self::Mcp | Self::Subagent
         )
     }
+
+    pub fn risky(self) -> bool {
+        matches!(
+            self,
+            Self::Shell | Self::Hook | Self::Plugin | Self::Mcp | Self::Subagent
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PermissionMode {
+    Plan,
+    Confirm,
+    Auto,
+    Yolo,
+}
+
+impl Default for PermissionMode {
+    fn default() -> Self {
+        Self::Confirm
+    }
+}
+
+impl PermissionMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Plan => Self::Confirm,
+            Self::Confirm => Self::Auto,
+            Self::Auto => Self::Yolo,
+            Self::Yolo => Self::Plan,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Plan => "Plan",
+            Self::Confirm => "Confirm",
+            Self::Auto => "Auto",
+            Self::Yolo => "Yolo",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,20 +86,46 @@ pub enum ApprovalChoice {
 
 #[derive(Debug, Default)]
 pub struct PermissionPolicy {
-    pub plan_mode: bool,
+    mode: PermissionMode,
     grants: HashMap<PermissionKind, ApprovalChoice>,
 }
 
 impl PermissionPolicy {
-    pub fn set_plan_mode(&mut self, enabled: bool) {
-        self.plan_mode = enabled;
+    pub fn mode(&self) -> PermissionMode {
+        self.mode
     }
+
+    pub fn set_mode(&mut self, mode: PermissionMode) {
+        self.mode = mode;
+        self.grants.clear();
+    }
+
+    pub fn cycle_mode(&mut self) {
+        self.set_mode(self.mode.next());
+    }
+
+    pub fn set_plan_mode(&mut self, enabled: bool) {
+        self.set_mode(if enabled {
+            PermissionMode::Plan
+        } else {
+            PermissionMode::Confirm
+        });
+    }
+
+    pub fn plan_mode(&self) -> bool {
+        self.mode == PermissionMode::Plan
+    }
+
     pub fn check(&self, kind: PermissionKind) -> Result<bool> {
         if kind == PermissionKind::Read {
             return Ok(true);
         }
-        if self.plan_mode && kind.mutates() {
+        if self.mode == PermissionMode::Plan && kind.mutates() {
             return Ok(false);
+        }
+        if self.mode == PermissionMode::Yolo || (self.mode == PermissionMode::Auto && !kind.risky())
+        {
+            return Ok(true);
         }
         Ok(matches!(
             self.grants.get(&kind),
@@ -75,8 +142,19 @@ impl PermissionPolicy {
         handler: &mut dyn ApprovalHandler,
         session: Option<&mut Session>,
     ) -> Result<()> {
-        if self.plan_mode && kind.mutates() {
+        if self.mode == PermissionMode::Plan && kind.mutates() {
             return Err(VeraError::Permission("plan mode blocks mutating tools".into()).into());
+        }
+        if self.mode == PermissionMode::Yolo || (self.mode == PermissionMode::Auto && !kind.risky())
+        {
+            if let Some(session) = session {
+                session.append(crate::sessions::SessionRecord::Approval {
+                    action: description.into(),
+                    scope: self.mode.label().into(),
+                    granted: true,
+                })?;
+            }
+            return Ok(());
         }
         if matches!(
             self.grants.get(&kind),
@@ -253,5 +331,36 @@ mod tests {
         assert!(policy.check(PermissionKind::Shell).unwrap());
         policy.remember(PermissionKind::Network, ApprovalChoice::Once);
         assert!(!policy.check(PermissionKind::Network).unwrap());
+    }
+
+    #[test]
+    fn modes_cycle_in_requested_order() {
+        let mut policy = PermissionPolicy::default();
+        assert_eq!(policy.mode(), PermissionMode::Confirm);
+        policy.cycle_mode();
+        assert_eq!(policy.mode(), PermissionMode::Auto);
+        policy.cycle_mode();
+        assert_eq!(policy.mode(), PermissionMode::Yolo);
+        policy.cycle_mode();
+        assert_eq!(policy.mode(), PermissionMode::Plan);
+        policy.cycle_mode();
+        assert_eq!(policy.mode(), PermissionMode::Confirm);
+    }
+
+    #[test]
+    fn auto_approves_non_risky_and_external_actions_but_not_risky_tools() {
+        let mut policy = PermissionPolicy::default();
+        policy.set_mode(PermissionMode::Auto);
+        assert!(policy.check(PermissionKind::Write).unwrap());
+        assert!(policy.check(PermissionKind::Network).unwrap());
+        assert!(!policy.check(PermissionKind::Shell).unwrap());
+    }
+
+    #[test]
+    fn yolo_approves_without_changing_hard_path_invariants() {
+        let mut policy = PermissionPolicy::default();
+        policy.set_mode(PermissionMode::Yolo);
+        assert!(policy.check(PermissionKind::Shell).unwrap());
+        assert!(policy.check(PermissionKind::Mcp).unwrap());
     }
 }

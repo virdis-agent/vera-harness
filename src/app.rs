@@ -1,6 +1,5 @@
 use std::fmt::Write as FmtWrite;
 use std::fs;
-use std::io;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -21,10 +20,12 @@ use crate::prompt::{approximate_tokens, build_context};
 use crate::providers::{
     Provider, ProviderKind, ProviderRequest, ResponsesProvider, provider_catalog,
 };
-use crate::safety::{PathGuard, PermissionKind, PermissionPolicy, TerminalApproval};
+use crate::safety::{
+    PathGuard, PermissionKind, PermissionMode, PermissionPolicy, TerminalApproval,
+};
 use crate::sessions::SessionStore;
 use crate::tools::{ToolCall, ToolContext, ToolRegistry, execute};
-use crate::ui::{Dashboard, render_dashboard};
+use crate::ui::{Dashboard, InputAction, read_input, render_dashboard};
 
 pub async fn run(cli: CommandLine) -> Result<()> {
     let paths = VeraPaths::discover()?;
@@ -579,13 +580,20 @@ async fn run_interactive(
             model: &config.model,
             context_tokens: session.context_tokens(),
             context_limit: config.context_window_tokens,
-            plan_mode: policy.plan_mode,
+            mode: policy.mode(),
         })?;
-        let mut line = String::new();
-        if io::stdin().read_line(&mut line)? == 0 {
-            break;
-        }
-        frame.finish_input()?;
+        let line = match read_input()? {
+            InputAction::CycleMode => {
+                policy.cycle_mode();
+                continue;
+            }
+            InputAction::Cancel => continue,
+            InputAction::Exit => break,
+            InputAction::Submit(line) => {
+                frame.finish_input()?;
+                line
+            }
+        };
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -594,12 +602,24 @@ async fn run_interactive(
             "/quit" | "/exit" => break,
             "/help" | "/commands" => print_interactive_help(),
             "/plan" => {
-                policy.set_plan_mode(!policy.plan_mode);
-                println!("plan mode: {}", policy.plan_mode);
+                policy.set_mode(PermissionMode::Plan);
+                println!("mode: {}", policy.mode().label());
+            }
+            "/confirm" => {
+                policy.set_mode(PermissionMode::Confirm);
+                println!("mode: {}", policy.mode().label());
+            }
+            "/auto" => {
+                policy.set_mode(PermissionMode::Auto);
+                println!("mode: {}", policy.mode().label());
+            }
+            "/yolo" => {
+                policy.set_mode(PermissionMode::Yolo);
+                println!("mode: {}", policy.mode().label());
             }
             "/permissions" => println!(
-                "read=automatic; writes/shell/network/hooks/plugins/MCP require approval; plan mode={}",
-                policy.plan_mode
+                "mode={}; Plan=read-only; Confirm=ask; Auto=non-risky/external auto; Yolo=never ask",
+                policy.mode().label()
             ),
             "/context" => println!(
                 "{} tokens; {} instruction file(s); {} skill(s)",
@@ -652,6 +672,15 @@ async fn run_interactive(
                         kind.as_str()
                     ))?;
                 let provider = ResponsesProvider::new(kind, token)?;
+                let plan_mode = policy.mode() == PermissionMode::Plan;
+                let instructions = if plan_mode {
+                    format!(
+                        "{}\n\n# PLAN MODE\nResearch and inspect only. Do not modify files, run mutating commands, or claim implementation. Produce a structured plan with findings, assumptions, affected files, validation steps, and risks.",
+                        context.system
+                    )
+                } else {
+                    context.system.clone()
+                };
                 let response = run_agent_turn(
                     &provider,
                     ProviderRequest {
@@ -664,8 +693,12 @@ async fn run_interactive(
                                 content: message.content.clone(),
                             })
                             .collect(),
-                        tools: registry.schemas(),
-                        instructions: context.system.clone(),
+                        tools: if plan_mode {
+                            registry.read_only_schemas()
+                        } else {
+                            registry.schemas()
+                        },
+                        instructions,
                     },
                     AgentRunContext {
                         registry: &registry,
@@ -679,7 +712,17 @@ async fn run_interactive(
                 )
                 .await?;
                 if !response.is_empty() {
-                    session.add_message("assistant", response)?;
+                    session.add_message("assistant", response.clone())?;
+                    if plan_mode {
+                        print_plan_prompts(prompt, &response);
+                        session.append(crate::sessions::SessionRecord::Event {
+                            event: serde_json::json!({
+                                "kind": "plan_draft",
+                                "objective": prompt,
+                                "draft": response,
+                            }),
+                        })?;
+                    }
                 }
                 session.compact_if_needed(config.context_window_tokens)?;
             }
@@ -716,7 +759,21 @@ fn print_help() {
 
 fn print_interactive_help() {
     println!(
-        "/provider <id>  /model <id>  /plan  /permissions  /compact  /context  /diff  /undo  /resume <id>  /skills  /mcp  /agents  /quit"
+        "shift+tab cycle modes  /plan  /confirm  /auto  /yolo  /provider <id>  /model <id>  /permissions  /compact  /context  /diff  /undo  /resume <id>  /skills  /mcp  /agents  /quit"
+    );
+}
+
+fn print_plan_prompts(objective: &str, draft: &str) {
+    let implementation = format!(
+        "Implement the following Vera plan. Do not improvise beyond it without explaining why.\n\nObjective: {objective}\n\nPlan draft:\n{draft}"
+    );
+    println!("\n[Plan Draft]\n{draft}");
+    println!("\n[Prompt 1 — implement]\n{implementation}");
+    println!(
+        "\n[Prompt 2 — implement and clear context]\n{implementation}\n\nAfter implementation, clear the active context and continue verification from a fresh context."
+    );
+    println!(
+        "\n[Prompt 3 — implement, clear context, and invoke /goal]\n{implementation}\n\nAfter implementation, clear the active context, then invoke /goal with the objective above and continue until fully verified."
     );
 }
 

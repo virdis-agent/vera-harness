@@ -66,6 +66,26 @@ impl ToolRegistry {
     pub fn schemas(&self) -> Vec<ToolSchema> {
         self.tools.iter().map(|tool| tool.schema()).collect()
     }
+
+    pub fn read_only_schemas(&self) -> Vec<ToolSchema> {
+        self.tools
+            .iter()
+            .map(|tool| tool.schema())
+            .filter(|schema| {
+                matches!(
+                    schema.name.as_str(),
+                    "list_files"
+                        | "read_file"
+                        | "search"
+                        | "git_status_diff"
+                        | "question"
+                        | "plan"
+                        | "web_search"
+                        | "x_search"
+                )
+            })
+            .collect()
+    }
     pub fn find(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools
             .iter()
