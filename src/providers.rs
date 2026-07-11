@@ -15,6 +15,11 @@ use crate::error::VeraError;
 use crate::events::{Event, EventSink};
 use crate::paths::{VeraPaths, set_private_file};
 
+// The Codex models endpoint treats this as a client capability version, not
+// Vera's release identity. Keep it aligned with the official Codex catalog
+// schema Vera has validated and can safely consume.
+const OPENAI_CODEX_MODEL_CLIENT_VERSION: &str = "0.144.1";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderKind {
@@ -258,7 +263,7 @@ impl ResponsesProvider {
         let mut url = reqwest::Url::parse(self.model_endpoint())?;
         if self.kind == ProviderKind::OpenaiCodex {
             url.query_pairs_mut()
-                .append_pair("client_version", env!("CARGO_PKG_VERSION"));
+                .append_pair("client_version", OPENAI_CODEX_MODEL_CLIENT_VERSION);
         }
         Ok(url)
     }
@@ -631,7 +636,11 @@ pub fn parse_openai_models(body: &Value) -> Result<Vec<ModelInfo>> {
                 .map(|values| {
                     values
                         .iter()
-                        .filter_map(Value::as_str)
+                        .filter_map(|value| {
+                            value
+                                .as_str()
+                                .or_else(|| value.get("effort").and_then(Value::as_str))
+                        })
                         .map(str::to_owned)
                         .collect::<Vec<_>>()
                 })
@@ -861,8 +870,8 @@ mod tests {
     fn parses_openai_reasoning_metadata_and_priority() {
         let body = serde_json::json!({
             "models": [
-                {"slug":"slow","display_name":"Slow","priority":20,"default_reasoning_level":"high","supported_reasoning_levels":["low","high"]},
-                {"slug":"fast","display_name":"Fast","priority":1,"context_window":64000,"default_reasoning_level":"minimal","supported_reasoning_levels":["minimal","low"]}
+                {"slug":"slow","display_name":"Slow","priority":20,"default_reasoning_level":"high","supported_reasoning_levels":[{"effort":"low","description":"Fast"},{"effort":"high","description":"Deep"}]},
+                {"slug":"fast","display_name":"Fast","priority":1,"context_window":64000,"default_reasoning_level":"minimal","supported_reasoning_levels":["minimal",{"effort":"low"}]}
             ]
         });
         let models = parse_openai_models(&body).unwrap();
@@ -946,7 +955,7 @@ mod tests {
         assert_eq!(url.path(), "/backend-api/codex/models");
         assert_eq!(
             url.query(),
-            Some(format!("client_version={}", env!("CARGO_PKG_VERSION")).as_str())
+            Some(format!("client_version={OPENAI_CODEX_MODEL_CLIENT_VERSION}").as_str())
         );
         let request = provider
             .add_auth_headers(provider.http.get(url))
