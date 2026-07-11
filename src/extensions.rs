@@ -834,6 +834,10 @@ pub struct McpToolDescription {
     pub input_schema: Value,
     #[serde(default)]
     pub annotations: Value,
+    /// MCP tool metadata is retained for diagnostics and future adapters even
+    /// though the provider-neutral ToolSchema only forwards the JSON schema.
+    #[serde(rename = "_meta", default)]
+    pub metadata: Value,
 }
 
 impl McpClient {
@@ -1429,6 +1433,7 @@ mod tests {
             description: String::new(),
             input_schema: serde_json::json!({"type":"object"}),
             annotations: serde_json::json!({"readOnlyHint":false}),
+            metadata: serde_json::Value::Null,
         };
         assert!(!mcp_tool_is_read_only(&tool));
     }
@@ -1439,7 +1444,7 @@ mod tests {
         let command = r#"while IFS= read -r line; do
   case "$line" in
     *initialize*) id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}}\n' "$id" ;;
-    *tools/list*) id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"read_fixture","description":"fixture","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":true}},{"name":"bad","inputSchema":{"type":"array"}}]}}\n' "$id" ;;
+    *tools/list*) id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"read_fixture","description":"fixture","inputSchema":{"type":"object","properties":{}},"annotations":{"readOnlyHint":true},"_meta":{"fixture":true}},{"name":"bad","inputSchema":{"type":"array"}}]}}\n' "$id" ;;
     *tools/call*) id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); (sleep 0.02; printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"fixture result %s"}]}}\n' "$id" "$id") & ;;
   esac
 done
@@ -1462,6 +1467,7 @@ done
         };
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "read_fixture");
+        assert_eq!(tools[0].metadata["fixture"], true);
         assert_eq!(client.server_info().await["name"], "fixture");
         let (first, second) = tokio::join!(
             client.call("read_fixture", serde_json::json!({})),
