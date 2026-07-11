@@ -946,6 +946,36 @@ mod tests {
     }
 
     #[test]
+    fn session_scope_approval_signatures_survive_resume() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = VeraPaths::from_home(directory.path().join("home")).unwrap();
+        let store = SessionStore::new(paths);
+        let mut session = store
+            .create(
+                directory.path().to_path_buf(),
+                "fixture".into(),
+                "model".into(),
+            )
+            .unwrap();
+        let action = ActionSignature {
+            permission_kind: crate::safety::PermissionKind::Shell,
+            tool_name: Some("shell".into()),
+            command_prefix: Some("printf fixture".into()),
+            ..ActionSignature::default()
+        };
+        session
+            .append(SessionRecord::Approval {
+                action: "run shell".into(),
+                scope: "Session".into(),
+                granted: true,
+                signature: Some(action.clone()),
+            })
+            .unwrap();
+        let resumed = store.open(&session.header.id).unwrap();
+        assert_eq!(resumed.approval_grants(), &[action]);
+    }
+
+    #[test]
     fn session_open_rejects_path_traversal_ids() {
         let directory = tempfile::tempdir().unwrap();
         let paths = VeraPaths::from_home(directory.path().join("home")).unwrap();
