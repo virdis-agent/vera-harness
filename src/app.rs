@@ -178,6 +178,7 @@ async fn run_upgrade(paths: &VeraPaths) -> Result<()> {
 }
 
 fn find_release_assets(releases: &[serde_json::Value]) -> Result<(String, u64, u64)> {
+    let mut selected = None;
     for release in releases {
         let Some(tag) = release.get("tag_name").and_then(serde_json::Value::as_str) else {
             continue;
@@ -198,10 +199,25 @@ fn find_release_assets(releases: &[serde_json::Value]) -> Result<(String, u64, u
                 .flatten()
         });
         if let (Some(archive_id), Some(checksum_id)) = (archive_id, checksum_id) {
-            return Ok((version.to_owned(), archive_id, checksum_id));
+            let key = release_version_key(version);
+            if selected
+                .as_ref()
+                .is_none_or(|current: &(Vec<u64>, String, u64, u64)| key > current.0)
+            {
+                selected = Some((key, version.to_owned(), archive_id, checksum_id));
+            }
         }
     }
-    anyhow::bail!("no compatible Vera release assets were found")
+    selected
+        .map(|(_, version, archive_id, checksum_id)| (version, archive_id, checksum_id))
+        .context("no compatible Vera release assets were found")
+}
+
+fn release_version_key(version: &str) -> Vec<u64> {
+    version
+        .split(|character: char| !character.is_ascii_digit())
+        .filter_map(|part| part.parse().ok())
+        .collect()
 }
 
 async fn fetch_release_asset(client: &reqwest::Client, asset_id: u64) -> Result<Vec<u8>> {
@@ -2488,6 +2504,30 @@ mod tests {
     }
 
     struct ScriptedApproval;
+
+    #[test]
+    fn upgrade_selects_highest_release_version_not_api_order() {
+        let releases = vec![
+            serde_json::json!({
+                "tag_name": "v0.1.0-alpha.9",
+                "assets": [
+                    {"name":"vera-0.1.0-alpha.9-aarch64-apple-darwin.tar.gz","id":9},
+                    {"name":"SHA256SUMS","id":90}
+                ]
+            }),
+            serde_json::json!({
+                "tag_name": "v0.1.0-alpha.10",
+                "assets": [
+                    {"name":"vera-0.1.0-alpha.10-aarch64-apple-darwin.tar.gz","id":10},
+                    {"name":"SHA256SUMS","id":100}
+                ]
+            }),
+        ];
+        assert_eq!(
+            find_release_assets(&releases).unwrap(),
+            ("0.1.0-alpha.10".into(), 10, 100)
+        );
+    }
 
     #[async_trait::async_trait]
     impl ApprovalHandler for ScriptedApproval {
