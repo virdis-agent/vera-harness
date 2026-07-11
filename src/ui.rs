@@ -1,9 +1,9 @@
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
 use anyhow::Result;
 use crossterm::{
-    cursor::MoveTo,
+    cursor::{self, MoveTo, RestorePosition, SavePosition},
     execute,
     style::{Color, Stylize},
     terminal::{self, Clear, ClearType},
@@ -50,7 +50,35 @@ const BORDER: Color = Color::Rgb {
     b: 96,
 };
 
-pub fn render_dashboard(dashboard: &Dashboard<'_>) -> Result<()> {
+pub struct DashboardFrame {
+    line: String,
+    footer_line: String,
+    mcp_servers: usize,
+    plan_mode: bool,
+    output_row: u16,
+    interactive: bool,
+}
+
+impl DashboardFrame {
+    pub fn finish_input(self) -> Result<()> {
+        let mut stdout = io::stdout();
+        if self.interactive {
+            execute!(stdout, MoveTo(0, self.output_row))?;
+        } else {
+            draw_decorations(
+                &self.line,
+                &self.footer_line,
+                self.mcp_servers,
+                self.plan_mode,
+                false,
+            );
+        }
+        stdout.flush()?;
+        Ok(())
+    }
+}
+
+pub fn render_dashboard(dashboard: &Dashboard<'_>) -> Result<DashboardFrame> {
     let mut stdout = io::stdout();
     let width = terminal::size()
         .map(|(width, _)| width as usize)
@@ -92,11 +120,6 @@ pub fn render_dashboard(dashboard: &Dashboard<'_>) -> Result<()> {
     println!();
 
     let line = "─".repeat(width.max(24));
-    println!("{}", line.clone().with(BORDER));
-    print!("  ");
-    stdout.flush()?;
-    println!();
-    println!("{}", line.with(BORDER));
 
     let percent = if dashboard.context_limit == 0 {
         0.0
@@ -110,24 +133,74 @@ pub fn render_dashboard(dashboard: &Dashboard<'_>) -> Result<()> {
     );
     let footer_right = format!("({}) {} • high", dashboard.provider, dashboard.model);
     let footer_gap = width.saturating_sub(footer_left.len() + footer_right.len());
-    println!(
-        "{}{}{}",
-        footer_left.with(MUTED),
-        " ".repeat(footer_gap),
-        footer_right.with(MUTED)
-    );
-    println!(
-        "{} {}",
-        format!("MCP: {}/4 servers", dashboard.mcp_servers).with(TEAL),
-        if dashboard.plan_mode {
-            "⏸ Plan".with(GOLD)
-        } else {
-            "⏵ Safe".with(GOLD)
-        }
-    );
+    let footer_line = format!("{}{}{}", footer_left, " ".repeat(footer_gap), footer_right);
+    let interactive = stdout.is_terminal();
+    if interactive {
+        println!("{}", line.clone().with(BORDER));
+    } else {
+        println!("{line}");
+    }
     print!("{}", "> ".with(DIM));
     stdout.flush()?;
-    Ok(())
+    let (_, prompt_row) = if interactive {
+        cursor::position()?
+    } else {
+        (0, 0)
+    };
+    let output_row = prompt_row.saturating_add(4);
+    if interactive {
+        execute!(
+            stdout,
+            SavePosition,
+            MoveTo(0, prompt_row.saturating_add(1))
+        )?;
+        draw_decorations(
+            &line,
+            &footer_line,
+            dashboard.mcp_servers,
+            dashboard.plan_mode,
+            true,
+        );
+        execute!(stdout, RestorePosition)?;
+        stdout.flush()?;
+    }
+    Ok(DashboardFrame {
+        line,
+        footer_line,
+        mcp_servers: dashboard.mcp_servers,
+        plan_mode: dashboard.plan_mode,
+        output_row,
+        interactive,
+    })
+}
+
+fn draw_decorations(
+    line: &str,
+    footer_line: &str,
+    mcp_servers: usize,
+    plan_mode: bool,
+    colored: bool,
+) {
+    if colored {
+        println!("{}", line.with(BORDER));
+        println!("{}", footer_line.with(MUTED));
+        print!("{} ", format!("MCP: {mcp_servers}/4 servers").with(TEAL));
+        println!(
+            "{}",
+            if plan_mode {
+                "⏸ Plan".with(GOLD)
+            } else {
+                "⏵ Safe".with(GOLD)
+            }
+        );
+    } else {
+        println!("{line}");
+        println!("{footer_line}");
+        println!(
+            "MCP: {mcp_servers}/4 servers {}",
+            if plan_mode { "⏸ Plan" } else { "⏵ Safe" }
+        );
+    }
 }
 
 fn section(title: &str, entries: &[String], width: usize) {
