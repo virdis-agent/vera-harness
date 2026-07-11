@@ -192,10 +192,7 @@ fn draw_decorations(
     } else {
         println!("{line}");
         println!("{footer_line}");
-        println!(
-            "MCP: {mcp_servers}/4 servers {}",
-            format!("⏵ {}", mode.label())
-        );
+        println!("MCP: {mcp_servers}/4 servers ⏵ {}", mode.label());
     }
 }
 

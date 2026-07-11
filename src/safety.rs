@@ -42,18 +42,13 @@ impl PermissionKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PermissionMode {
     Plan,
+    #[default]
     Confirm,
     Auto,
     Yolo,
-}
-
-impl Default for PermissionMode {
-    fn default() -> Self {
-        Self::Confirm
-    }
 }
 
 impl PermissionMode {
