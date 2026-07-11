@@ -1,0 +1,11 @@
+provider = "openai-codex"
+model = "gpt-5.6"
+shell_timeout_seconds = 120
+context_window_tokens = 128000
+
+[approval]
+auto_read = true
+writes = "once"
+shell = "once"
+network = "once"
+
