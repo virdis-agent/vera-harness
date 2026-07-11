@@ -6,7 +6,7 @@ class VeraHarness < Formula
 
   on_arm do
     url "https://github.com/virdis-agent/vera-harness/releases/download/v#{version}/vera-#{version}-aarch64-apple-darwin.tar.gz"
-    sha256 "6f91e73250fb08fbeffac2414952dae27b839169456b783169aee7692127919d"
+    sha256 "76a45bd3fd9dbbdb56f70316804ba21cf20e092bd2b2342b040f6a18a53217b0"
   end
 
   def install
