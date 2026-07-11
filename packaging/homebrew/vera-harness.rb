@@ -1,7 +1,7 @@
 class VeraHarness < Formula
   desc "macOS-first coding agent CLI"
   homepage "https://github.com/virdis-agent/vera-harness"
-  version "0.1.0-alpha.5"
+  version "0.1.0-alpha.6"
   license "MIT"
 
   on_arm do
