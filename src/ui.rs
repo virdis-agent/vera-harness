@@ -109,7 +109,8 @@ pub fn render_dashboard(dashboard: &Dashboard<'_>) -> Result<DashboardFrame> {
     );
     println!(
         "{}",
-        "shift+tab switch mode · ctrl+d exit · /commands for help · /compact context".with(MUTED)
+        "shift+tab switch mode · ctrl+c twice or ctrl+d exit · /commands for help · /compact context"
+            .with(MUTED)
     );
     println!(
         "{}\n",
@@ -218,68 +219,92 @@ pub enum InputAction {
     Exit,
 }
 
-pub fn read_input() -> Result<InputAction> {
+pub fn read_input(ctrl_c_pending: &mut bool) -> Result<InputAction> {
     let stdin = io::stdin();
     if !stdin.is_terminal() || !io::stdout().is_terminal() {
         let mut line = String::new();
         if stdin.read_line(&mut line)? == 0 {
+            *ctrl_c_pending = false;
             return Ok(InputAction::Exit);
         }
+        *ctrl_c_pending = false;
         return Ok(InputAction::Submit(line));
     }
 
     terminal::enable_raw_mode()?;
-    let result = read_raw_input();
+    let result = read_raw_input(ctrl_c_pending);
     terminal::disable_raw_mode()?;
     result
 }
 
-fn read_raw_input() -> Result<InputAction> {
+fn read_raw_input(ctrl_c_pending: &mut bool) -> Result<InputAction> {
     let mut stdout = io::stdout();
     let mut input = String::new();
     loop {
         match event::read()? {
             Event::Paste(text) => {
+                *ctrl_c_pending = false;
                 input.push_str(&text);
                 print!("{text}");
                 stdout.flush()?;
             }
-            Event::Key(key) => match key.code {
-                KeyCode::BackTab => return Ok(InputAction::CycleMode),
-                KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    return Ok(InputAction::CycleMode);
+            Event::Key(key) => {
+                let is_ctrl_c = matches!(key.code, KeyCode::Char('c'))
+                    && key.modifiers.contains(KeyModifiers::CONTROL);
+                if !is_ctrl_c {
+                    *ctrl_c_pending = false;
                 }
-                KeyCode::Enter => {
-                    print!("\r\n");
-                    stdout.flush()?;
-                    return Ok(InputAction::Submit(input));
-                }
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    print!("^C\r\n");
-                    stdout.flush()?;
-                    return Ok(InputAction::Cancel);
-                }
-                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    print!("\r\n");
-                    stdout.flush()?;
-                    return Ok(InputAction::Exit);
-                }
-                KeyCode::Char(character) => {
-                    input.push(character);
-                    print!("{character}");
-                    stdout.flush()?;
-                }
-                KeyCode::Backspace => {
-                    if input.pop().is_some() {
-                        print!("\x08 \x08");
+                match key.code {
+                    KeyCode::BackTab => {
+                        return Ok(InputAction::CycleMode);
+                    }
+                    KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        return Ok(InputAction::CycleMode);
+                    }
+                    KeyCode::Enter => {
+                        print!("\r\n");
+                        stdout.flush()?;
+                        return Ok(InputAction::Submit(input));
+                    }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        print!("^C\r\n");
+                        stdout.flush()?;
+                        return Ok(handle_ctrl_c(ctrl_c_pending));
+                    }
+                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        print!("\r\n");
+                        stdout.flush()?;
+                        return Ok(InputAction::Exit);
+                    }
+                    KeyCode::Char(character) => {
+                        input.push(character);
+                        print!("{character}");
                         stdout.flush()?;
                     }
+                    KeyCode::Backspace => {
+                        if input.pop().is_some() {
+                            print!("\x08 \x08");
+                            stdout.flush()?;
+                        }
+                    }
+                    KeyCode::Esc => {
+                        return Ok(InputAction::Cancel);
+                    }
+                    _ => {}
                 }
-                KeyCode::Esc => return Ok(InputAction::Cancel),
-                _ => {}
-            },
+            }
             _ => {}
         }
+    }
+}
+
+fn handle_ctrl_c(ctrl_c_pending: &mut bool) -> InputAction {
+    if *ctrl_c_pending {
+        *ctrl_c_pending = false;
+        InputAction::Exit
+    } else {
+        *ctrl_c_pending = true;
+        InputAction::Cancel
     }
 }
 
@@ -319,7 +344,7 @@ fn wrap(entries: &[String], width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{mode_color, wrap};
+    use super::{InputAction, mode_color, wrap};
     use crate::safety::PermissionMode;
 
     #[test]
@@ -341,5 +366,21 @@ mod tests {
         for (index, color) in colors.iter().enumerate() {
             assert!(!colors[index + 1..].contains(color));
         }
+    }
+
+    #[test]
+    fn second_ctrl_c_exits() {
+        let mut ctrl_c_pending = false;
+
+        assert!(matches!(
+            super::handle_ctrl_c(&mut ctrl_c_pending),
+            InputAction::Cancel
+        ));
+        assert!(ctrl_c_pending);
+        assert!(matches!(
+            super::handle_ctrl_c(&mut ctrl_c_pending),
+            InputAction::Exit
+        ));
+        assert!(!ctrl_c_pending);
     }
 }
