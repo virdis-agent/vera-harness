@@ -416,6 +416,7 @@ fn cached_catalog(paths: &VeraPaths, provider: ProviderKind) -> Result<ModelCata
 
 async fn provider_catalog_for(paths: &VeraPaths, provider: ProviderKind) -> Result<ModelCatalog> {
     let store = TokenStore::new(paths.clone());
+    let mut live_error = None;
     let live = if let Some(token) = usable_token(&store, provider).await? {
         let client = ResponsesProvider::new(provider, token)?;
         match client.models().await {
@@ -426,10 +427,20 @@ async fn provider_catalog_for(paths: &VeraPaths, provider: ProviderKind) -> Resu
                 cache_catalog(paths, provider, &catalog)?;
                 Some(catalog)
             }
-            Ok(_) => None,
-            Err(_) => None,
+            Ok(_) => {
+                live_error = Some("provider returned an empty model catalog".to_owned());
+                None
+            }
+            Err(error) => {
+                live_error = Some(error.to_string());
+                None
+            }
         }
     } else {
+        live_error = Some(format!(
+            "not authenticated; run `vera auth login {}`",
+            provider.as_str()
+        ));
         None
     };
     if let Some(catalog) = live {
@@ -438,9 +449,9 @@ async fn provider_catalog_for(paths: &VeraPaths, provider: ProviderKind) -> Resu
     let cached = cached_catalog(paths, provider)?;
     if cached.for_provider(provider).is_empty() {
         anyhow::bail!(
-            "live {} model discovery failed and no cached catalog exists; run `vera auth login {}`",
+            "live {} model discovery failed: {}; no cached catalog exists",
             provider.as_str(),
-            provider.as_str()
+            live_error.unwrap_or_else(|| "unknown error".into())
         );
     }
     Ok(cached)

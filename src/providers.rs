@@ -254,6 +254,17 @@ impl ResponsesProvider {
         }
     }
 
+    fn add_auth_headers(&self, mut builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        builder = builder.bearer_auth(&self.token.access_token);
+        if let Some(account_id) = &self.token.account_id {
+            builder = builder.header("chatgpt-account-id", account_id);
+        }
+        if self.kind == ProviderKind::OpenaiCodex {
+            builder = builder.header("originator", "codex_cli_rs");
+        }
+        builder
+    }
+
     fn body(&self, request: &ProviderRequest) -> Value {
         let input: Vec<Value> = request
             .input
@@ -343,18 +354,12 @@ impl Provider for ResponsesProvider {
         {
             return Err(VeraError::Provider("provider does not support image input".into()).into());
         }
-        let mut builder = self
+        let builder = self
             .http
             .post(self.endpoint())
-            .bearer_auth(&self.token.access_token)
             .header(CONTENT_TYPE, "application/json")
             .json(&self.body(&request));
-        if let Some(account_id) = &self.token.account_id {
-            builder = builder.header("chatgpt-account-id", account_id);
-        }
-        if self.kind == ProviderKind::OpenaiCodex {
-            builder = builder.header("originator", "codex_cli_rs");
-        }
+        let builder = self.add_auth_headers(builder);
         let response = builder.send().await.context("provider request")?;
         let expected_origin = match self.kind {
             ProviderKind::OpenaiCodex => "https://chatgpt.com",
@@ -405,9 +410,7 @@ impl Provider for ResponsesProvider {
 
     async fn models(&self) -> Result<ModelCatalog> {
         let response = self
-            .http
-            .get(self.model_endpoint())
-            .bearer_auth(&self.token.access_token)
+            .add_auth_headers(self.http.get(self.model_endpoint()))
             .send()
             .await?;
         let expected_origin = match self.kind {
@@ -897,6 +900,39 @@ mod tests {
         fixed.effort = None;
         assert!(fixed.effort.is_none());
         assert!(provider.body(&fixed).get("reasoning").is_none());
+    }
+
+    #[test]
+    fn openai_model_discovery_uses_account_scoped_auth_headers() {
+        let provider = ResponsesProvider::new(
+            ProviderKind::OpenaiCodex,
+            TokenRecord {
+                provider: AuthProvider::OpenaiCodex,
+                access_token: "access".into(),
+                refresh_token: None,
+                expires_at: None,
+                account_id: Some("account".into()),
+                token_type: "Bearer".into(),
+                xai_token_endpoint: None,
+            },
+        )
+        .unwrap();
+        let request = provider
+            .add_auth_headers(provider.http.get(provider.model_endpoint()))
+            .build()
+            .unwrap();
+        assert_eq!(
+            request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .unwrap(),
+            "Bearer access"
+        );
+        assert_eq!(
+            request.headers().get("chatgpt-account-id").unwrap(),
+            "account"
+        );
+        assert_eq!(request.headers().get("originator").unwrap(), "codex_cli_rs");
     }
 
     #[test]
