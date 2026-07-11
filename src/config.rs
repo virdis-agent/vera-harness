@@ -1,4 +1,5 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -6,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::paths::VeraPaths;
-use crate::safety::{PermissionEffect, PermissionPolicy, PermissionRule};
+use crate::safety::{PathGuard, PermissionEffect, PermissionPolicy, PermissionRule};
 
 pub const CURRENT_CONFIG_VERSION: u32 = 2;
 
@@ -120,7 +121,20 @@ impl Config {
         let mut current = self.clone();
         current.version = CURRENT_CONFIG_VERSION;
         let contents = toml::to_string_pretty(&current)?;
-        fs::write(paths.root.join("config.toml"), contents)?;
+        let guard = PathGuard::new(paths.root.clone())?;
+        let target = guard.resolve(Path::new("config.toml"))?;
+        let temporary = target.with_file_name(format!(
+            ".config.vera-tmp-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(temporary, target)?;
+        crate::paths::set_private_file(&target)?;
         Ok(())
     }
 
