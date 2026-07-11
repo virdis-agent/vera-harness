@@ -321,18 +321,21 @@ impl ResponsesProvider {
         if let Some(effort) = &request.effort {
             body["reasoning"] = json!({"effort": effort});
         }
-        if !request.tools.is_empty() {
-            body["tools"] = Value::Array(
-                request
-                    .tools
-                    .iter()
-                    .map(|tool| match tool.name.as_str() {
-                        "web_search" => json!({"type":"web_search_preview"}),
-                        "x_search" => json!({"type":"x_search"}),
-                        _ => json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.parameters}),
-                    })
-                    .collect(),
-            );
+        let tools = request
+            .tools
+            .iter()
+            .filter_map(|tool| match (self.kind, tool.name.as_str()) {
+                (ProviderKind::OpenaiCodex, "web_search") => {
+                    Some(json!({"type":"web_search_preview"}))
+                }
+                (ProviderKind::OpenaiCodex, "x_search") => None,
+                (ProviderKind::XaiOauth, "web_search") => None,
+                (ProviderKind::XaiOauth, "x_search") => Some(json!({"type":"x_search"})),
+                _ => Some(json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.parameters})),
+            })
+            .collect::<Vec<_>>();
+        if !tools.is_empty() {
+            body["tools"] = Value::Array(tools);
         }
         body
     }
@@ -387,8 +390,10 @@ impl Provider for ResponsesProvider {
             .into());
         }
         if !response.status().is_success() {
+            let status = response.status();
+            let detail = safe_provider_detail(response).await;
             return Err(
-                VeraError::Provider(format!("provider returned {}", response.status())).into(),
+                VeraError::Provider(format!("provider returned {status}: {detail}")).into(),
             );
         }
         let mut decoder = SseDecoder::default();
@@ -452,9 +457,12 @@ impl Provider for ResponsesProvider {
 }
 
 async fn safe_provider_detail(response: reqwest::Response) -> String {
+    safe_provider_detail_text(&response.text().await.unwrap_or_default())
+}
+
+fn safe_provider_detail_text(text: &str) -> String {
     const MAX_CHARS: usize = 512;
-    let text = response.text().await.unwrap_or_default();
-    let redacted = redact(&text);
+    let redacted = redact(text);
     let mut chars = redacted.chars();
     let detail: String = chars.by_ref().take(MAX_CHARS).collect();
     if chars.next().is_some() {
@@ -934,6 +942,114 @@ mod tests {
         fixed.effort = None;
         assert!(fixed.effort.is_none());
         assert!(provider.body(&fixed).get("reasoning").is_none());
+    }
+
+    #[test]
+    fn request_body_filters_provider_native_tools() {
+        fn provider(kind: ProviderKind) -> ResponsesProvider {
+            ResponsesProvider::new(
+                kind,
+                TokenRecord {
+                    provider: kind.auth_provider(),
+                    access_token: "access".into(),
+                    refresh_token: None,
+                    expires_at: None,
+                    account_id: None,
+                    token_type: "Bearer".into(),
+                    xai_token_endpoint: None,
+                },
+            )
+            .unwrap()
+        }
+
+        let request = ProviderRequest {
+            model: "model".into(),
+            input: vec![ProviderInput::message("user", "hello")],
+            tools: vec![
+                ToolSchema {
+                    name: "web_search".into(),
+                    description: "web".into(),
+                    parameters: json!({"type":"object"}),
+                },
+                ToolSchema {
+                    name: "x_search".into(),
+                    description: "x".into(),
+                    parameters: json!({"type":"object"}),
+                },
+                ToolSchema {
+                    name: "read_file".into(),
+                    description: "read".into(),
+                    parameters: json!({"type":"object"}),
+                },
+            ],
+            instructions: "instructions".into(),
+            effort: None,
+        };
+
+        let openai = provider(ProviderKind::OpenaiCodex).body(&request);
+        assert_eq!(openai["tools"].as_array().unwrap().len(), 2);
+        assert!(
+            openai["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| { tool["type"] == "web_search_preview" })
+        );
+        assert!(
+            !openai["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| { tool["type"] == "x_search" })
+        );
+        assert!(
+            openai["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| { tool["type"] == "function" && tool["name"] == "read_file" })
+        );
+
+        let xai = provider(ProviderKind::XaiOauth).body(&request);
+        assert_eq!(xai["tools"].as_array().unwrap().len(), 2);
+        assert!(
+            xai["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| { tool["type"] == "x_search" })
+        );
+        assert!(
+            !xai["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| { tool["type"] == "web_search_preview" })
+        );
+        assert!(
+            xai["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| { tool["type"] == "function" && tool["name"] == "read_file" })
+        );
+    }
+
+    #[test]
+    fn provider_error_details_are_redacted_bounded_and_never_empty() {
+        assert_eq!(
+            safe_provider_detail_text("   "),
+            "provider returned no error details"
+        );
+
+        let redacted =
+            safe_provider_detail_text(r#"{"error":"bad request","access_token":"super-secret"}"#);
+        assert!(redacted.contains("bad request"));
+        assert!(!redacted.contains("super-secret"));
+
+        let long = safe_provider_detail_text(&"x".repeat(600));
+        assert_eq!(long.chars().count(), 513);
+        assert!(long.ends_with('…'));
     }
 
     #[test]
