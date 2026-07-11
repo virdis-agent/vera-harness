@@ -673,6 +673,17 @@ impl McpRegistry {
         policy: &mut PermissionPolicy,
         approval: &mut dyn ApprovalHandler,
     ) -> Result<String> {
+        let root = std::env::current_dir()?;
+        self.test_in(name, policy, approval, &root).await
+    }
+
+    pub async fn test_in(
+        &self,
+        name: &str,
+        policy: &mut PermissionPolicy,
+        approval: &mut dyn ApprovalHandler,
+        root: &Path,
+    ) -> Result<String> {
         let spec = self
             .list()?
             .into_iter()
@@ -706,8 +717,7 @@ impl McpRegistry {
                 )
                 .await?;
         }
-        let root = std::env::current_dir()?;
-        let client = McpClient::new(spec.clone(), root);
+        let client = McpClient::new(spec.clone(), root.to_path_buf());
         let tools = match client.tools().await {
             Ok(tools) => tools,
             Err(error) => {

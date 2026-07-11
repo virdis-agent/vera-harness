@@ -91,6 +91,16 @@ impl Default for ApprovalConfig {
 }
 
 impl Config {
+    pub fn load_global(paths: &VeraPaths) -> Result<Self> {
+        let mut config = Self::default();
+        if let Some(global) = read_toml(&paths.root.join("config.toml"))? {
+            config.apply_toml(&global, &paths.root, false)?;
+        }
+        config.validate()?;
+        config.version = CURRENT_CONFIG_VERSION;
+        Ok(config)
+    }
+
     pub fn load(paths: &VeraPaths, project: &Path) -> Result<Self> {
         let mut config = Self::default();
         if let Some(global) = read_toml(&paths.root.join("config.toml"))? {

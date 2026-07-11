@@ -1248,7 +1248,7 @@ impl Tool for WriteFile {
             .and_then(Value::as_str)
             .context("missing content")?;
         if let Some(session) = context.session.as_deref_mut() {
-            session.record_preimage(path.clone(), fs::read_to_string(&path).ok())?;
+            session.record_binary_preimage(path.clone(), fs::read(&path).ok())?;
         }
         atomic_write(&path, content)?;
         Ok(ToolResult::complete(

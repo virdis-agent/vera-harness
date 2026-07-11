@@ -52,7 +52,7 @@ pub async fn run(cli: CommandLine) -> Result<()> {
             run_session_resume(&paths, config, id).await?
         }
         Command::Inspect => inspect(&paths, &root, &config)?,
-        Command::Mcp(command) => run_mcp(&paths, command).await?,
+        Command::Mcp(command) => run_mcp(&paths, &root, &config, command).await?,
         Command::Permissions(command) => run_permissions(&config, command)?,
         Command::Plugin(command) => run_plugin(&paths, &config, command).await?,
         Command::Update => run_upgrade(&paths).await?,
@@ -728,7 +728,12 @@ fn inspect(paths: &VeraPaths, root: &Path, config: &Config) -> Result<()> {
     Ok(())
 }
 
-async fn run_mcp(paths: &VeraPaths, command: McpCommand) -> Result<()> {
+async fn run_mcp(
+    paths: &VeraPaths,
+    root: &Path,
+    effective_config: &Config,
+    command: McpCommand,
+) -> Result<()> {
     let registry = McpRegistry::new(paths.clone());
     match command {
         McpCommand::List => {
@@ -747,9 +752,7 @@ async fn run_mcp(paths: &VeraPaths, command: McpCommand) -> Result<()> {
                 .into_iter()
                 .find(|spec| spec.name == server)
                 .context("MCP server not found")?;
-            let project = std::env::current_dir()?;
-            let config = Config::load(paths, &project)?;
-            let mut policy = config.permission_policy();
+            let mut policy = effective_config.permission_policy();
             let mut approval = TerminalApproval;
             policy
                 .authorize_action(
@@ -779,19 +782,18 @@ async fn run_mcp(paths: &VeraPaths, command: McpCommand) -> Result<()> {
                     )
                     .await?;
             }
-            let client = crate::extensions::McpClient::new(spec, std::env::current_dir()?);
+            let client = crate::extensions::McpClient::new(spec, root.to_path_buf());
             for tool in client.tools().await? {
                 println!("{}\t{}", tool.name, tool.description);
             }
             client.shutdown().await?;
         }
         McpCommand::Enable { ref server } | McpCommand::Disable { ref server } => {
-            let mut config = Config::load(paths, &std::env::current_dir()?)?;
             if registry.list()?.iter().all(|spec| spec.name != *server) {
                 anyhow::bail!("MCP server {server} is unavailable");
             }
             let enabled = matches!(&command, McpCommand::Enable { .. });
-            let mut policy = config.permission_policy();
+            let mut policy = effective_config.permission_policy();
             let mut approval = TerminalApproval;
             policy
                 .authorize_action(
@@ -816,6 +818,7 @@ async fn run_mcp(paths: &VeraPaths, command: McpCommand) -> Result<()> {
                     None,
                 )
                 .await?;
+            let mut config = Config::load_global(paths)?;
             if enabled && !config.enabled_mcp.contains(server) {
                 config.enabled_mcp.push(server.clone());
             }
@@ -829,12 +832,13 @@ async fn run_mcp(paths: &VeraPaths, command: McpCommand) -> Result<()> {
             );
         }
         McpCommand::Test { name } => {
-            let config = Config::load(paths, &std::env::current_dir()?)?;
-            let mut policy = config.permission_policy();
+            let mut policy = effective_config.permission_policy();
             let mut approval = TerminalApproval;
             println!(
                 "{}",
-                registry.test(&name, &mut policy, &mut approval).await?
+                registry
+                    .test_in(&name, &mut policy, &mut approval, root)
+                    .await?
             );
         }
     }
@@ -1648,7 +1652,19 @@ async fn run_interactive(
                                 client.shutdown().await?;
                             }
                         }
-                        registry.remove_tools_starting_with("mcp__");
+                        for server in &disabled_mcp {
+                            registry.remove_tools_starting_with(&format!("mcp__{server}__"));
+                            if active_mcp.iter().all(|active| active != server) {
+                                session.record_mcp_state(server, false)?;
+                            }
+                            session.record_mcp_lifecycle(
+                                server,
+                                crate::sessions::LifecycleState {
+                                    state: "stopped".into(),
+                                    detail: None,
+                                },
+                            )?;
+                        }
                         plugins = enabled_plugins(paths, &config, &session_plugins)?;
                         *skills.lock().await = SkillCatalog::load_with_plugins(
                             paths,
@@ -1659,7 +1675,7 @@ async fn run_interactive(
                         session.set_selection(CapabilitySelection {
                             enabled_plugins: session_plugins.clone(),
                             enabled_mcp: active_mcp.clone(),
-                            loaded_skills: Vec::new(),
+                            loaded_skills: skills.lock().await.loaded_names().cloned().collect(),
                             ..session.selection.clone()
                         })?;
                         println!("disabled extension {name}");
