@@ -192,19 +192,32 @@ impl BrowserManager {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .chars()
-            .take(MAX_SNAPSHOT_CHARS)
+            .take(MAX_SNAPSHOT_CHARS / 2)
             .collect::<String>();
         let accessibility = self
             .command("Accessibility.getFullAXTree", json!({}))
             .await
             .unwrap_or_else(|_| json!({"unavailable": true}));
+        let accessibility = bound_snapshot_value(&accessibility, MAX_SNAPSHOT_CHARS / 4);
+        let console_errors = self
+            .status()
+            .await?
+            .console_errors
+            .into_iter()
+            .rev()
+            .take(16)
+            .map(|mut error| {
+                error.message = error.message.chars().take(500).collect();
+                error.url = error.url.chars().take(500).collect();
+                error
+            })
+            .collect::<Vec<_>>();
         let snapshot = json!({
             "dom": dom,
             "accessibility": accessibility,
-            "console_errors": self.status().await?.console_errors,
+            "console_errors": console_errors,
         });
-        let encoded = serde_json::to_string(&snapshot)?;
-        Ok(encoded.chars().take(MAX_SNAPSHOT_CHARS).collect())
+        Ok(serde_json::to_string(&snapshot)?)
     }
 
     pub async fn screenshot(&self) -> Result<Vec<u8>> {
@@ -237,6 +250,14 @@ impl BrowserManager {
         }
         Ok(result)
     }
+}
+
+fn bound_snapshot_value(value: &Value, limit: usize) -> Value {
+    let encoded = serde_json::to_vec(value).unwrap_or_default();
+    if encoded.len() <= limit {
+        return value.clone();
+    }
+    json!({"truncated":true,"original_bytes":encoded.len()})
 }
 
 fn record_console_event(status: &mut BrowserStatus, event: &Value) {

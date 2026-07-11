@@ -1502,4 +1502,26 @@ done
         assert!(client.tools().await.is_err());
         assert!(marker.exists());
     }
+
+    #[tokio::test]
+    async fn mcp_request_timeout_cancels_and_shuts_down_the_client() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = r#"while IFS= read -r line; do case "$line" in *initialize*) id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}}}}\n' "$id" ;; *tools/list*) id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"slow","inputSchema":{"type":"object"}}]}}\n' "$id" ;; *tools/call*) sleep 5 ;; esac; done"#;
+        let spec = McpSpec {
+            name: "timeout-fixture".into(),
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            timeout_ms: 50,
+            allowed_tools: Vec::new(),
+            network: false,
+        };
+        let client = McpClient::for_fixture(spec, temp.path().to_path_buf());
+        assert_eq!(client.tools().await.unwrap().len(), 1);
+        let error = client
+            .call("slow", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(!client.is_started().await);
+    }
 }

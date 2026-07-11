@@ -261,6 +261,15 @@ impl Config {
                 }
             }
         }
+        for endpoint in &self.browser_cdp_endpoints {
+            let parsed = Url::parse(endpoint)
+                .with_context(|| format!("invalid browser_cdp_endpoints entry {endpoint:?}"))?;
+            if parsed.scheme() != "http" || parsed.host_str().is_none() {
+                anyhow::bail!(
+                    "browser_cdp_endpoints entries must be explicit http:// endpoints: {endpoint:?}"
+                );
+            }
+        }
         if self.context_window_tokens == 0 {
             anyhow::bail!("context_window_tokens must be greater than zero");
         }
