@@ -1,6 +1,6 @@
 [package]
 name = "vera-harness"
-version = "0.1.0-alpha.7"
+version = "0.1.0-alpha.12"
 edition = "2024"
 description = "Vera, a macOS-first coding agent CLI"
 license = "MIT"
@@ -21,6 +21,8 @@ dirs = "6"
 fs2 = "0.4"
 futures-util = "0.3"
 ignore = "0.4"
+libc = "0.2"
+portable-pty = "0.9"
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }

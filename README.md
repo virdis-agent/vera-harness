@@ -2,7 +2,7 @@
 
 Vera is a macOS-first coding-agent CLI with a small, replaceable Rust core. It launches as `vera`, keeps an inline JSONL transcript, inspects repositories on demand, and uses native tools behind explicit approval boundaries.
 
-This is an `0.x` compatibility adapter for subscription OAuth flows exposed by the providers’ own CLIs. It currently targets Apple Silicon macOS 13+ and defaults to `gpt-5.6` through ChatGPT/Codex OAuth or `grok-4.5` through xAI OAuth.
+This is an `0.x` compatibility adapter for subscription OAuth flows exposed by the providers’ own CLIs. It currently targets Apple Silicon macOS 13+ and discovers the available models through ChatGPT/Codex OAuth or xAI OAuth.
 
 ## Install
 
@@ -16,7 +16,7 @@ The installer verifies the release archive against `SHA256SUMS` before placing `
 
 ## Status
 
-The repository contains the `0.1.0-alpha.7` core: manual CLI parsing, compact prompts, pinned OAuth/provider interfaces, protected token storage, Responses/SSE normalization, bounded tool calls, Seatbelt execution, Plan/Confirm/Auto/Yolo permission modes, Shift+Tab mode switching, mode-specific prompt and border colors, double Ctrl+C exit handling, path/symlink guards, atomic edit journals, JSONL sessions/compaction, AGENTS.md and Skills discovery, hooks, local plugins, stdio MCP, bounded subagent coordination, a compact colored terminal dashboard, and verified in-place upgrades.
+The repository contains the `0.1.0-alpha.12` core: manual CLI parsing, compact prompts, pinned OAuth/provider interfaces, protected token storage, Responses/SSE normalization, bounded tool calls, Seatbelt execution, Plan/Confirm/Auto/Yolo permission modes, Shift+Tab mode switching, mode-specific prompt and border colors, double Ctrl+C exit handling, path/symlink guards, atomic edit journals, versioned JSONL sessions/compaction, AGENTS.md and Skills discovery, runtime capability catalogs, loaded skills, reusable prompts, inert-by-default plugins, hooks, persistent stdio MCP, interactive questions/plans, PTY processes, guarded CDP/image inspection, worktree-isolated in-process subagents, a compact colored terminal dashboard, and verified in-place upgrades.
 
 Subscription OAuth is intentionally isolated in compatibility adapters. Real provider accounts and live endpoint contracts should be smoke-tested before each release.
 
@@ -42,21 +42,25 @@ vera                         # interactive session in the current repository
 vera path/to/repository
 vera -p "inspect the auth boundary" --output text
 vera -p "summarize the diff" --output jsonl
+vera --prompt-template review --prompt-args "focus on error handling" --output jsonl
 vera auth login openai-codex
 vera auth login xai-oauth --no-browser
 vera models --refresh
+vera -p "inspect the auth boundary" --effort high
 vera inspect
 vera session list
 vera upgrade
 ```
 
-Interactive commands include `/provider`, `/model`, `/plan`, `/confirm`, `/auto`, `/yolo`, `/permissions`, `/compact`, `/context`, `/diff`, `/undo`, `/resume`, `/skills`, `/mcp`, `/agents`, and `/quit`. Press `Shift+Tab` to cycle Plan → Confirm → Auto → Yolo.
+Interactive commands include `/provider <id>`, `/models`, `/model [<id>]`, `/effort [<level>]`, `/skills`, `/skill load|unload <name>`, `/prompts`, `/prompt <name> [arguments]`, `/extensions`, `/extension enable|disable <name>`, `/mcp`, `/processes`, `/agents`, `/agent <id>`, `/plan`, and `/permissions [deny|ask|allow] <kind>`. `/model` opens a cancellable numbered picker; `/model auto` and `/effort auto` restore catalog defaults. Skills expose only metadata until loaded by command or the read-only `load_skill` tool. Plugins are inert until enabled. Press `Shift+Tab` to cycle Plan → Confirm → Auto → Yolo. In JSONL/headless mode, a question emits `needs_input` and exits nonzero; resume it interactively with `/resume <id>`.
+
+Global defaults live in `~/.vera/config.toml`; project defaults live in `.vera/config.toml`, with project capability selections taking precedence. Reusable Markdown prompts are loaded from `~/.vera/prompts`, configured roots, enabled plugin roots, and `.vera/prompts` (project wins). MCP tools are namespaced as `mcp__server__tool`; every server start and tool call is separately permission-matched. Configure exact CDP endpoints with `browser_cdp_endpoints` or approve an endpoint interactively.
 
 ## Security model
 
 Repository reads are automatic. Writes, shell, network, external paths, hooks, plugins, MCP processes, and subagents are approval-gated. Plan mode blocks mutations. Paths are canonicalized and symlink escapes are rejected. Child environments are allowlisted and never receive the auth store. Tokens live under `~/.vera/auth.json` with private modes, locking, atomic replacement, refresh rotation, origin pinning, and redaction.
 
-Sessions are append-only versioned JSONL under `~/.vera/sessions`. They record messages, tool calls, approvals, preimages, and compaction events, never credentials. `/undo` only restores Vera-managed preimages.
+Sessions are append-only versioned JSONL under `~/.vera/sessions`. They record messages, typed provider inputs/tool calls, selections, loaded skills, MCP/process/subagent/worktree lifecycle, plans, pending questions, hook results, provider usage, approvals, preimages, compaction events, and task-scoped settings, never credentials. Provider-reported input usage is authoritative; before the first response the dashboard labels the full-request local estimate. `/undo` only restores Vera-managed preimages. Persistent memory and cross-session search are intentionally out of scope.
 
 ## Distribution
 

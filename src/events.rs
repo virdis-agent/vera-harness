@@ -37,6 +37,11 @@ pub enum Event {
     Status {
         message: String,
     },
+    NeedsInput {
+        question_id: String,
+        prompt: String,
+        choices: Vec<String>,
+    },
 }
 
 #[async_trait]
@@ -81,6 +86,14 @@ impl EventSink for TerminalEventSink {
                 Event::Completed => self.stdout.write_all(b"\n")?,
                 Event::Error { message, .. } => eprintln!("\n[error] {message}"),
                 Event::Status { message } => eprintln!("[vera] {message}"),
+                Event::NeedsInput {
+                    prompt, choices, ..
+                } => {
+                    eprintln!("\n[input required] {prompt}");
+                    if !choices.is_empty() {
+                        eprintln!("choices: {}", choices.join(" | "));
+                    }
+                }
             },
         }
         Ok(())

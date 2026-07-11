@@ -11,6 +11,7 @@ pub struct PromptContext {
     pub system: String,
     pub instructions: Vec<PathBuf>,
     pub skills: Vec<String>,
+    pub loaded_skills: Vec<String>,
 }
 
 pub fn build_context(
@@ -26,17 +27,28 @@ pub fn build_context(
         system.push('\n');
         system.push_str(&fs::read_to_string(path)?);
     }
-    let active_skills = skills.active_descriptions();
-    for (name, description) in &active_skills {
-        system.push_str("\n\n# Skill: ");
+    let available_skills = skills.active_descriptions();
+    if !available_skills.is_empty() {
+        system.push_str("\n\n# Available skills\n");
+    }
+    for (name, description) in &available_skills {
+        system.push_str("- ");
         system.push_str(name);
-        system.push('\n');
+        system.push_str(": ");
         system.push_str(description);
+        system.push('\n');
+    }
+    for (name, body) in skills.loaded_bodies()? {
+        system.push_str("\n\n# Loaded skill: ");
+        system.push_str(&name);
+        system.push('\n');
+        system.push_str(&body);
     }
     Ok(PromptContext {
         system,
         instructions,
-        skills: active_skills.into_iter().map(|(name, _)| name).collect(),
+        skills: available_skills.into_iter().map(|(name, _)| name).collect(),
+        loaded_skills: skills.loaded_names().cloned().collect(),
     })
 }
 
