@@ -961,22 +961,22 @@ impl McpClient {
             {
                 Ok(value) => value,
                 Err(error) => {
-                    shutdown_mcp_process(created).await;
+                    self.shutdown_and_capture(created).await;
                     return Err(error);
                 }
             };
             if initialize.get("error").is_some() {
-                shutdown_mcp_process(created).await;
+                self.shutdown_and_capture(created).await;
                 anyhow::bail!("MCP initialize failed: {}", redact(&initialize.to_string()));
             }
             let Some(negotiated_version) =
                 initialize.get("protocolVersion").and_then(Value::as_str)
             else {
-                shutdown_mcp_process(created).await;
+                self.shutdown_and_capture(created).await;
                 anyhow::bail!("MCP initialize did not negotiate a protocol version");
             };
             if !supported_mcp_protocol_version(negotiated_version) {
-                shutdown_mcp_process(created).await;
+                self.shutdown_and_capture(created).await;
                 anyhow::bail!("unsupported MCP protocol version {negotiated_version}");
             }
             if initialize
@@ -985,7 +985,7 @@ impl McpClient {
                 .and_then(Value::as_object)
                 .is_none()
             {
-                shutdown_mcp_process(created).await;
+                self.shutdown_and_capture(created).await;
                 anyhow::bail!("MCP server did not advertise the tools capability");
             }
             if let Some(server_info) = initialize.get("serverInfo")
@@ -1005,7 +1005,7 @@ impl McpClient {
                 )
                 .await
             {
-                shutdown_mcp_process(created).await;
+                self.shutdown_and_capture(created).await;
                 return Err(error);
             }
             *process = Some(created);
@@ -1154,10 +1154,14 @@ impl McpClient {
     pub async fn shutdown(&self) -> Result<()> {
         let mut guard = self.process.lock().await;
         if let Some(process) = guard.take() {
-            *self.last_stderr.lock().await = process.stderr.lock().await.clone();
-            shutdown_mcp_process(process).await;
+            self.shutdown_and_capture(process).await;
         }
         Ok(())
+    }
+
+    async fn shutdown_and_capture(&self, process: Arc<McpProcess>) {
+        shutdown_mcp_process(process.clone()).await;
+        *self.last_stderr.lock().await = process.stderr.lock().await.clone();
     }
 
     pub async fn stderr(&self) -> String {
@@ -1172,8 +1176,6 @@ impl McpClient {
 }
 
 async fn shutdown_mcp_process(process: Arc<McpProcess>) {
-    process.reader_task.abort();
-    process.stderr_task.abort();
     let _ = process.stdin.lock().await.take();
     let mut child = process.child.lock().await;
     if timeout(Duration::from_millis(500), child.wait())
@@ -1182,6 +1184,21 @@ async fn shutdown_mcp_process(process: Arc<McpProcess>) {
     {
         let _ = child.kill().await;
         let _ = child.wait().await;
+    }
+    drop(child);
+
+    // Let the bounded stderr reader observe EOF after the child exits. This
+    // keeps crash and timeout diagnostics available to callers after cleanup.
+    // A misbehaving pipe still cannot hold shutdown indefinitely.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+    while !process.stderr_task.is_finished() && tokio::time::Instant::now() < deadline {
+        tokio::task::yield_now().await;
+    }
+    if !process.stderr_task.is_finished() {
+        process.stderr_task.abort();
+    }
+    if !process.reader_task.is_finished() {
+        process.reader_task.abort();
     }
 }
 
@@ -1480,6 +1497,84 @@ done
     }
 
     #[tokio::test]
+    async fn fixture_mcp_tool_adapter_enforces_permission_and_normalizes_result() -> Result<()> {
+        struct ApproveOnce;
+
+        #[async_trait]
+        impl ApprovalHandler for ApproveOnce {
+            async fn ask(
+                &mut self,
+                _kind: PermissionKind,
+                _description: &str,
+            ) -> Result<crate::safety::ApprovalChoice> {
+                Ok(crate::safety::ApprovalChoice::Once)
+            }
+        }
+
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root)?;
+        let command = r#"while IFS= read -r line; do
+  case "$line" in
+    *initialize*) id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}}}}\n' "$id" ;;
+    *tools/list*) id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"read_fixture","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}]}}\n' "$id" ;;
+    *tools/call*) id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"adapter result"}]}}\n' "$id" ;;
+  esac
+done
+"#;
+        let spec = McpSpec {
+            name: "adapter-fixture".into(),
+            command: "/bin/sh".into(),
+            args: vec!["-c".into(), command.into()],
+            timeout_ms: 2_000,
+            allowed_tools: vec!["read_fixture".into()],
+            network: false,
+        };
+        let client = Arc::new(McpClient::for_fixture(spec, root.clone()));
+        let description = client
+            .tools()
+            .await?
+            .pop()
+            .context("fixture tool missing")?;
+        let adapter = crate::tools::McpToolAdapter::new(client.clone(), description);
+        let guard = crate::safety::PathGuard::new(root.clone())?;
+        let paths = VeraPaths::from_home(temp.path().join("home"))?;
+        let mut session = crate::sessions::SessionStore::new(paths).create(
+            root,
+            "fixture".into(),
+            "fixture".into(),
+        )?;
+        let mut policy = PermissionPolicy::default();
+        let mut approval = ApproveOnce;
+        let result = crate::tools::Tool::call(
+            &adapter,
+            crate::tools::ToolContext {
+                guard: &guard,
+                policy: &mut policy,
+                approval: &mut approval,
+                session: Some(&mut session),
+                shell_timeout: 10,
+            },
+            serde_json::json!({}),
+        )
+        .await?;
+        assert!(matches!(
+            &result,
+            crate::tools::ToolResult::Complete {
+                is_error: false,
+                ..
+            }
+        ));
+        assert!(result.content().contains("adapter result"));
+        assert!(
+            session.approval_grants().is_empty(),
+            "once approvals must not become session grants"
+        );
+        client.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn oversized_mcp_lines_are_discarded_without_poisoning_the_reader() {
         let mut bytes = vec![b'x'; MAX_MCP_MESSAGE_BYTES + 1];
         bytes.push(b'\n');
@@ -1502,7 +1597,7 @@ marker="$1"
 trap 'printf cleaned > "$marker"' EXIT
 while IFS= read -r line; do
   case "$line" in
-    *initialize*) id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-03-26","capabilities":{}}}\n' "$id" ;;
+    *initialize*) printf 'fixture diagnostic\n' >&2; id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'); printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-03-26","capabilities":{}}}\n' "$id" ;;
   esac
 done
 "#;
@@ -1522,6 +1617,7 @@ done
         let client = McpClient::for_fixture(spec, temp.path().to_path_buf());
         assert!(client.tools().await.is_err());
         assert!(marker.exists());
+        assert!(client.stderr().await.contains("fixture diagnostic"));
     }
 
     #[tokio::test]

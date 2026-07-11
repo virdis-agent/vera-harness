@@ -14,6 +14,8 @@ use crate::prompt::approximate_tokens;
 use crate::providers::ProviderInput;
 use crate::safety::ActionSignature;
 
+pub const CURRENT_SESSION_VERSION: u32 = 2;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionHeader {
     #[serde(default = "default_session_version")]
@@ -262,7 +264,7 @@ impl SessionStore {
     ) -> Result<Session> {
         self.paths.ensure_runtime_dirs()?;
         let header = SessionHeader {
-            version: 2,
+            version: CURRENT_SESSION_VERSION,
             id: Uuid::new_v4().simple().to_string(),
             created_at: Utc::now(),
             root,
@@ -375,7 +377,13 @@ impl SessionStore {
                 _ => {}
             }
         }
-        let header = header.context("session has no header")?;
+        let mut header = header.context("session has no header")?;
+        if header.version > CURRENT_SESSION_VERSION {
+            anyhow::bail!("unsupported session version {}", header.version);
+        }
+        // Legacy alpha sessions remain readable with serde defaults. Upgrade
+        // the in-memory header so subsequent records use the current format.
+        header.version = CURRENT_SESSION_VERSION;
         let selection = selection.unwrap_or(CapabilitySelection {
             provider: header.provider.clone(),
             model: header.model.clone(),
@@ -857,6 +865,52 @@ mod tests {
         let resumed = store.open(&session.header.id).unwrap();
         assert_eq!(resumed.settings.effort.as_deref(), Some("high"));
         assert_eq!(SessionSettings::default().model, "auto");
+    }
+
+    #[test]
+    fn legacy_session_headers_migrate_in_memory_and_future_versions_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = VeraPaths::from_home(directory.path().join("home")).unwrap();
+        std::fs::create_dir_all(&paths.sessions).unwrap();
+        let legacy_id = "legacy-session";
+        let legacy_header = SessionRecord::Header(SessionHeader {
+            version: 1,
+            id: legacy_id.into(),
+            created_at: Utc::now(),
+            root: directory.path().to_path_buf(),
+            provider: "fixture".into(),
+            model: "fixture".into(),
+            effort: None,
+            context_capacity: default_context_capacity(),
+        });
+        std::fs::write(
+            paths.session_file(legacy_id),
+            format!("{}\n", serde_json::to_string(&legacy_header).unwrap()),
+        )
+        .unwrap();
+        let store = SessionStore::new(paths.clone());
+        assert_eq!(
+            store.open(legacy_id).unwrap().header.version,
+            CURRENT_SESSION_VERSION
+        );
+
+        let future_id = "future-session";
+        let future_header = SessionRecord::Header(SessionHeader {
+            version: CURRENT_SESSION_VERSION + 1,
+            id: future_id.into(),
+            created_at: Utc::now(),
+            root: directory.path().to_path_buf(),
+            provider: "fixture".into(),
+            model: "fixture".into(),
+            effort: None,
+            context_capacity: default_context_capacity(),
+        });
+        std::fs::write(
+            paths.session_file(future_id),
+            format!("{}\n", serde_json::to_string(&future_header).unwrap()),
+        )
+        .unwrap();
+        assert!(store.open(future_id).is_err());
     }
 
     #[test]

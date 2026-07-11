@@ -432,19 +432,21 @@ impl ProcessManager {
     }
 
     pub async fn shutdown_session(&self, session_id: &str) {
-        let processes = self.processes.lock().await;
-        for process in processes.values() {
-            if process.snapshot.session_id == session_id
-                && let Ok(mut child) = process.child.lock()
-            {
-                #[cfg(unix)]
-                if let Some(group) = process.process_group {
-                    let _ = unsafe { libc::kill(-group, libc::SIGHUP) };
-                } else {
-                    let _ = child.kill();
-                }
-                #[cfg(not(unix))]
-                let _ = child.kill();
+        let targets = self
+            .processes
+            .lock()
+            .await
+            .values()
+            .filter(|process| process.snapshot.session_id == session_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        for process in &targets {
+            let _ = request_terminate(process);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        for process in targets {
+            if process_is_running(&process) {
+                let _ = force_kill(&process);
             }
         }
     }
@@ -468,6 +470,10 @@ impl ProcessManager {
 }
 
 fn kill_managed_process(process: &ManagedProcess) -> Result<()> {
+    request_terminate(process)
+}
+
+fn request_terminate(process: &ManagedProcess) -> Result<()> {
     #[cfg(unix)]
     if let Some(group) = process.process_group
         && unsafe { libc::kill(-group, libc::SIGHUP) } == 0
@@ -478,8 +484,32 @@ fn kill_managed_process(process: &ManagedProcess) -> Result<()> {
         .child
         .lock()
         .map_err(|_| anyhow::anyhow!("process child lock poisoned"))?
-        .kill()?;
-    Ok(())
+        .kill()
+        .map_err(Into::into)
+}
+
+fn process_is_running(process: &ManagedProcess) -> bool {
+    process
+        .child
+        .lock()
+        .ok()
+        .and_then(|mut child| child.try_wait().ok())
+        .is_some_and(|status| status.is_none())
+}
+
+fn force_kill(process: &ManagedProcess) -> Result<()> {
+    #[cfg(unix)]
+    if let Some(group) = process.process_group
+        && unsafe { libc::kill(-group, libc::SIGKILL) } == 0
+    {
+        return Ok(());
+    }
+    process
+        .child
+        .lock()
+        .map_err(|_| anyhow::anyhow!("process child lock poisoned"))?
+        .kill()
+        .map_err(Into::into)
 }
 
 fn validate_environment_key(key: &str) -> Result<()> {
@@ -535,7 +565,7 @@ mod tests {
         let manager = ProcessManager::for_fixture();
         let snapshot = manager
             .start(ProcessStartRequest {
-                command: "echo ready; sleep 10".into(),
+                command: "trap '' HUP; echo ready; sleep 10".into(),
                 cwd: temp.path().to_path_buf(),
                 environment: BTreeMap::new(),
                 network: false,

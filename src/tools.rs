@@ -2314,6 +2314,10 @@ impl Tool for SubagentSpawn {
                     .map(|task| vec![task.to_owned()])
             })
             .context("subagent_spawn requires task or tasks")?;
+        let tasks = tasks.into_iter().take(4).collect::<Vec<_>>();
+        if tasks.is_empty() || tasks.iter().any(|task| task.trim().is_empty()) {
+            anyhow::bail!("subagent_spawn requires non-empty task(s)");
+        }
         let writes = arguments
             .get("writes")
             .and_then(Value::as_bool)
@@ -2348,10 +2352,7 @@ impl Tool for SubagentSpawn {
             .unwrap_or_else(|| "unattached".into());
         let root = context.guard.root().to_path_buf();
         let mut results = Vec::new();
-        for task in tasks.into_iter().take(4) {
-            if task.trim().is_empty() {
-                anyhow::bail!("subagent task must not be empty");
-            }
+        for task in tasks {
             let worktree_path = if writes {
                 let session = context
                     .session
@@ -2711,6 +2712,19 @@ pub type SharedToolRegistry = Arc<Mutex<ToolRegistry>>;
 mod tests {
     use super::*;
 
+    struct ApproveOnce;
+
+    #[async_trait]
+    impl ApprovalHandler for ApproveOnce {
+        async fn ask(
+            &mut self,
+            _kind: PermissionKind,
+            _description: &str,
+        ) -> Result<crate::safety::ApprovalChoice> {
+            Ok(crate::safety::ApprovalChoice::Once)
+        }
+    }
+
     #[test]
     fn normalizes_bounded_mcp_content_kinds() {
         let content = normalize_mcp_result(&json!({
@@ -2726,5 +2740,131 @@ mod tests {
         assert!(content.contains("MCP image"));
         assert!(content.contains("structured"));
         assert!(content.chars().count() <= 64_000);
+    }
+
+    #[tokio::test]
+    async fn process_tools_cover_start_poll_write_and_wait() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(&root)?;
+        let paths = crate::paths::VeraPaths::from_home(temp.path().join("home"))?;
+        let mut session = crate::sessions::SessionStore::new(paths).create(
+            root.clone(),
+            "fixture".into(),
+            "fixture".into(),
+        )?;
+        let guard = PathGuard::new(root.clone())?;
+        let processes = Arc::new(ProcessManager::for_fixture());
+        let registry = ToolRegistry::standard_with_skills_and_processes(None, processes);
+        let mut policy = PermissionPolicy::default();
+        let mut approval = ApproveOnce;
+        let start = execute(
+            &registry,
+            ToolCall {
+                name: "process_start".into(),
+                arguments: serde_json::json!({
+                    "command":"printf ready; read line; printf got:$line",
+                    "pty_size":{"columns":80,"rows":24}
+                }),
+            },
+            ToolContext {
+                guard: &guard,
+                policy: &mut policy,
+                approval: &mut approval,
+                session: Some(&mut session),
+                shell_timeout: 10,
+            },
+        )
+        .await?;
+        let process_id = match start {
+            ToolResult::BackgroundStarted { process_id } => process_id,
+            other => anyhow::bail!("unexpected process start result: {}", other.content()),
+        };
+
+        let mut ready = false;
+        for _ in 0..100 {
+            let output = execute(
+                &registry,
+                ToolCall {
+                    name: "process_poll".into(),
+                    arguments: serde_json::json!({"process_id":process_id,"cursor":0}),
+                },
+                ToolContext {
+                    guard: &guard,
+                    policy: &mut policy,
+                    approval: &mut approval,
+                    session: Some(&mut session),
+                    shell_timeout: 10,
+                },
+            )
+            .await?
+            .content();
+            if output.contains("ready") {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(ready, "process never emitted startup output");
+
+        execute(
+            &registry,
+            ToolCall {
+                name: "process_write".into(),
+                arguments: serde_json::json!({"process_id":process_id,"input":"hello\n"}),
+            },
+            ToolContext {
+                guard: &guard,
+                policy: &mut policy,
+                approval: &mut approval,
+                session: Some(&mut session),
+                shell_timeout: 10,
+            },
+        )
+        .await?;
+
+        let mut received = false;
+        for _ in 0..100 {
+            let output = execute(
+                &registry,
+                ToolCall {
+                    name: "process_poll".into(),
+                    arguments: serde_json::json!({"process_id":process_id,"cursor":0}),
+                },
+                ToolContext {
+                    guard: &guard,
+                    policy: &mut policy,
+                    approval: &mut approval,
+                    session: Some(&mut session),
+                    shell_timeout: 10,
+                },
+            )
+            .await?
+            .content();
+            if output.contains("got:hello") {
+                received = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(received, "process did not receive PTY input");
+        let waited = execute(
+            &registry,
+            ToolCall {
+                name: "process_wait".into(),
+                arguments: serde_json::json!({"process_id":process_id}),
+            },
+            ToolContext {
+                guard: &guard,
+                policy: &mut policy,
+                approval: &mut approval,
+                session: Some(&mut session),
+                shell_timeout: 10,
+            },
+        )
+        .await?;
+        assert!(!waited.is_error());
+        assert_eq!(session.process_lifecycle[&process_id].state, "exited");
+        Ok(())
     }
 }

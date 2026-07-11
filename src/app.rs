@@ -1995,6 +1995,19 @@ async fn cleanup_runtime(
     registry: &ToolRegistry,
     session: &mut crate::sessions::Session,
 ) -> Result<()> {
+    for agent in registry
+        .subagents()
+        .shutdown_session(&session.header.id)
+        .await
+    {
+        session.record_subagent_lifecycle(
+            agent.agent_id,
+            crate::sessions::LifecycleState {
+                state: agent.status,
+                detail: Some(agent.summary),
+            },
+        )?;
+    }
     let mcp_names = mcp_clients
         .iter()
         .map(|client| client.name().to_owned())

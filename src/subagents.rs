@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use uuid::Uuid;
 
 use crate::events::{Event, EventSink};
@@ -77,6 +77,7 @@ pub trait SubagentRunner: Send + Sync {
 struct AgentRecord {
     snapshot: SubagentSnapshot,
     cancellation: Arc<AtomicBool>,
+    completion: Arc<Notify>,
     root: PathBuf,
     worktree: Option<WorktreeInfo>,
 }
@@ -137,6 +138,7 @@ impl SubagentManager {
         let task = bound_summary(&task);
         let agent_id = Uuid::new_v4().simple().to_string();
         let cancellation = Arc::new(AtomicBool::new(false));
+        let completion = Arc::new(Notify::new());
         let snapshot = SubagentSnapshot {
             agent_id: agent_id.clone(),
             task: task.chars().take(4_000).collect(),
@@ -155,6 +157,7 @@ impl SubagentManager {
             AgentRecord {
                 snapshot: snapshot.clone(),
                 cancellation: cancellation.clone(),
+                completion: completion.clone(),
                 root: root.clone(),
                 worktree: worktree.clone(),
             },
@@ -162,6 +165,7 @@ impl SubagentManager {
 
         let agents = self.agents.clone();
         let permits = self.permits.clone();
+        let completion_for_task = completion.clone();
         let request = SubagentExecutionRequest {
             agent_id: agent_id.clone(),
             task: snapshot.task.clone(),
@@ -175,6 +179,7 @@ impl SubagentManager {
         };
         tokio::spawn(async move {
             let Ok(_permit) = permits.acquire_owned().await else {
+                completion_for_task.notify_one();
                 return;
             };
             update_snapshot(&agents, &agent_id, |snapshot| {
@@ -235,6 +240,7 @@ impl SubagentManager {
                 }
             })
             .await;
+            completion_for_task.notify_one();
         });
         Ok(snapshot)
     }
@@ -262,16 +268,59 @@ impl SubagentManager {
     }
 
     pub async fn cancel(&self, agent_id: &str) -> Result<SubagentSnapshot> {
-        let mut agents = self.agents.lock().await;
-        let agent = agents.get_mut(agent_id).context("subagent not found")?;
-        agent.cancellation.store(true, Ordering::Relaxed);
-        agent.snapshot.status = "cancelled".into();
-        agent.snapshot.summary = "cancellation requested by the parent session".into();
-        Ok(agent.snapshot.clone())
+        let completion = {
+            let mut agents = self.agents.lock().await;
+            let agent = agents.get_mut(agent_id).context("subagent not found")?;
+            if matches!(
+                agent.snapshot.status.as_str(),
+                "completed" | "failed" | "cancelled" | "merged" | "discarded"
+            ) {
+                return Ok(agent.snapshot.clone());
+            }
+            agent.cancellation.store(true, Ordering::Relaxed);
+            agent.snapshot.status = "cancellation_requested".into();
+            agent.snapshot.summary = "cancellation requested by the parent session".into();
+            agent.completion.clone()
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(2), completion.notified()).await;
+        self.status(agent_id).await
     }
 
     pub async fn result(&self, agent_id: &str) -> Result<SubagentSnapshot> {
         self.status(agent_id).await
+    }
+
+    /// Cancel all active children for a closing parent session. Write
+    /// worktrees are intentionally left in place for explicit review or
+    /// discard after cancellation.
+    pub async fn shutdown_session(&self, session_id: &str) -> Vec<SubagentSnapshot> {
+        let active = {
+            let mut agents = self.agents.lock().await;
+            agents
+                .values_mut()
+                .filter(|agent| {
+                    agent.snapshot.session_id == session_id
+                        && !matches!(
+                            agent.snapshot.status.as_str(),
+                            "completed" | "failed" | "cancelled" | "merged" | "discarded"
+                        )
+                })
+                .map(|agent| {
+                    agent.cancellation.store(true, Ordering::Relaxed);
+                    agent.snapshot.status = "cancellation_requested".into();
+                    agent.snapshot.summary = "parent session is closing".into();
+                    (agent.snapshot.agent_id.clone(), agent.completion.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        for (_, completion) in &active {
+            let _ = tokio::time::timeout(Duration::from_secs(2), completion.notified()).await;
+        }
+        let agents = self.agents.lock().await;
+        active
+            .into_iter()
+            .filter_map(|(agent_id, _)| agents.get(&agent_id).map(|agent| agent.snapshot.clone()))
+            .collect()
     }
 
     pub async fn merge(&self, agent_id: &str, session: &mut Session) -> Result<SubagentSnapshot> {
@@ -727,6 +776,38 @@ mod tests {
             manager.status(&snapshot.agent_id).await.unwrap().status,
             "cancelled"
         );
+    }
+
+    struct CancellationRunner;
+
+    #[async_trait]
+    impl SubagentRunner for CancellationRunner {
+        async fn run(&self, request: SubagentExecutionRequest) -> Result<String> {
+            while !request.cancellation.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            anyhow::bail!("cancelled")
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_session_cancels_active_children_and_keeps_result_visible() {
+        let manager = SubagentManager::new();
+        manager.set_runner(Arc::new(CancellationRunner));
+        let snapshot = manager
+            .spawn(
+                "long task".into(),
+                false,
+                "closing-session".into(),
+                PathBuf::from("."),
+                None,
+            )
+            .await
+            .unwrap();
+        let stopped = manager.shutdown_session("closing-session").await;
+        assert_eq!(stopped.len(), 1);
+        assert_eq!(stopped[0].agent_id, snapshot.agent_id);
+        assert_eq!(stopped[0].status, "cancelled");
     }
 
     struct MockProvider;
