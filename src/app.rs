@@ -1,4 +1,4 @@
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -19,6 +19,7 @@ use crate::providers::{
 use crate::safety::{PathGuard, PermissionKind, PermissionPolicy, TerminalApproval};
 use crate::sessions::SessionStore;
 use crate::tools::{ToolCall, ToolContext, ToolRegistry, execute};
+use crate::ui::{Dashboard, render_dashboard};
 
 pub async fn run(cli: CommandLine) -> Result<()> {
     let paths = VeraPaths::discover()?;
@@ -358,15 +359,53 @@ async fn run_interactive(
     let registry = ToolRegistry::standard();
     let mut policy = PermissionPolicy::default();
     let mut approval = TerminalApproval;
-    println!(
-        "Vera {} — {} / {}\nType /help for commands.",
-        env!("CARGO_PKG_VERSION"),
-        config.provider,
-        config.model
-    );
+    let root_path = root.to_path_buf();
+    let prompts = vec![
+        "/commands".into(),
+        "/provider <id>".into(),
+        "/model <id>".into(),
+        "/plan".into(),
+        "/compact".into(),
+        "/undo".into(),
+    ];
     loop {
-        print!("\nvera> ");
-        io::stdout().flush()?;
+        let instructions = context
+            .instructions
+            .iter()
+            .map(|path| {
+                path.strip_prefix(root).map_or_else(
+                    |_| path.display().to_string(),
+                    |relative| relative.display().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let skill_names = skills.names().cloned().collect::<Vec<_>>();
+        let mut extensions = vec![
+            "hooks".into(),
+            "stdio MCP".into(),
+            "bounded subagents".into(),
+        ];
+        extensions.extend(
+            PluginManager::new(paths.clone())
+                .list()?
+                .into_iter()
+                .map(|plugin| format!("plugin:{}", plugin.name)),
+        );
+        let mcp_servers = McpRegistry::new(paths.clone()).list()?.len();
+        render_dashboard(&Dashboard {
+            version: env!("CARGO_PKG_VERSION"),
+            root: &root_path,
+            instructions: &instructions,
+            skills: &skill_names,
+            prompts: &prompts,
+            extensions: &extensions,
+            mcp_servers,
+            provider: &config.provider,
+            model: &config.model,
+            context_tokens: session.context_tokens(),
+            context_limit: config.context_window_tokens,
+            plan_mode: policy.plan_mode,
+        })?;
         let mut line = String::new();
         if io::stdin().read_line(&mut line)? == 0 {
             break;
@@ -377,7 +416,7 @@ async fn run_interactive(
         }
         match line {
             "/quit" | "/exit" => break,
-            "/help" => print_interactive_help(),
+            "/help" | "/commands" => print_interactive_help(),
             "/plan" => {
                 policy.set_plan_mode(!policy.plan_mode);
                 println!("plan mode: {}", policy.plan_mode);
@@ -467,7 +506,6 @@ async fn run_interactive(
                     session.add_message("assistant", response)?;
                 }
                 session.compact_if_needed(config.context_window_tokens)?;
-                let _ = (&guard, &mut approval);
             }
         }
     }

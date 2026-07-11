@@ -322,7 +322,7 @@ impl McpRegistry {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         let mut child = command.spawn()?;
-        let request = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"vera","version":"0.1.0-alpha.1"}}});
+        let request = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"vera","version":"0.1.0-alpha.2"}}});
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(format!("{}\n", request).as_bytes()).await?;
         }

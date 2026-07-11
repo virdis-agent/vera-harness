@@ -16,7 +16,7 @@ The installer verifies the release archive against `SHA256SUMS` before placing `
 
 ## Status
 
-The repository contains the `0.1.0-alpha.1` core: manual CLI parsing, compact prompts, pinned OAuth/provider interfaces, protected token storage, Responses/SSE normalization, bounded tool calls, Seatbelt execution, approvals, plan mode, path/symlink guards, atomic edit journals, JSONL sessions/compaction, AGENTS.md and Skills discovery, hooks, local plugins, stdio MCP, and bounded subagent coordination.
+The repository contains the `0.1.0-alpha.2` core: manual CLI parsing, compact prompts, pinned OAuth/provider interfaces, protected token storage, Responses/SSE normalization, bounded tool calls, Seatbelt execution, approvals, plan mode, path/symlink guards, atomic edit journals, JSONL sessions/compaction, AGENTS.md and Skills discovery, hooks, local plugins, stdio MCP, bounded subagent coordination, and a compact colored terminal dashboard.
 
 Subscription OAuth is intentionally isolated in compatibility adapters. Real provider accounts and live endpoint contracts should be smoke-tested before each release.
 

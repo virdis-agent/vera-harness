@@ -13,6 +13,7 @@ mod providers;
 mod safety;
 mod sessions;
 mod tools;
+mod ui;
 
 use anyhow::Result;
 
