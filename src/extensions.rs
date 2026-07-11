@@ -530,6 +530,7 @@ fn valid_mcp_component(value: &str) -> bool {
     !value.is_empty()
         && value.chars().count() <= 128
         && !value.contains("..")
+        && !value.contains("__")
         && value.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
         })
@@ -1373,6 +1374,29 @@ mod tests {
             prompts: Vec::new(),
         };
         assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn mcp_names_cannot_escape_the_dynamic_namespace() {
+        let manifest = PluginManifest {
+            name: "demo".into(),
+            version: "1".into(),
+            skills: Vec::new(),
+            hooks: Vec::new(),
+            mcp: vec![McpSpec {
+                name: "../escape".into(),
+                command: "/bin/true".into(),
+                args: Vec::new(),
+                timeout_ms: 1_000,
+                allowed_tools: Vec::new(),
+                network: false,
+            }],
+            roles: Vec::new(),
+            prompts: Vec::new(),
+        };
+        assert!(manifest.validate().is_err());
+        assert!(!valid_mcp_component("tool/name"));
+        assert!(valid_mcp_component("tool.read"));
     }
 
     #[cfg(unix)]
