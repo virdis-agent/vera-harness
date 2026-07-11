@@ -690,6 +690,14 @@ fn inspect(paths: &VeraPaths, root: &Path, config: &Config) -> Result<()> {
             }
         );
     }
+    println!("browser CDP endpoints:");
+    if config.browser_cdp_endpoints.is_empty() {
+        println!("  none (explicit browser approval required)");
+    } else {
+        for endpoint in &config.browser_cdp_endpoints {
+            println!("  {endpoint}");
+        }
+    }
     println!("models:");
     for model in model_catalog(paths)?.for_provider(ProviderKind::parse(&config.provider)?) {
         println!("  {}\t{} tokens", model.id, model.context_window);
