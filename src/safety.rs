@@ -670,21 +670,19 @@ impl Sandbox {
         #[cfg(target_os = "macos")]
         {
             command = Command::new("/usr/bin/sandbox-exec");
+            let safe_cwd = escape_sandbox_path(cwd);
             let network_rule = if network {
                 "(allow network*)"
             } else {
                 "(deny network*)"
             };
             let write_rule = if writable {
-                format!("(allow file-write* (subpath \"{}\"))", cwd.display())
+                format!("(allow file-write* (subpath \"{safe_cwd}\"))")
             } else {
                 "(deny file-write*)".into()
             };
             let profile = format!(
-                "(version 1) (deny default) (allow process*) (allow file-read* (subpath \"{}\") (subpath \"/bin\") (subpath \"/usr/bin\") (subpath \"/usr/lib\") (subpath \"/System/Library\") (subpath \"/Library\")) {} {}",
-                cwd.display(),
-                write_rule,
-                network_rule
+                "(version 1) (deny default) (allow process*) (allow file-read* (subpath \"{safe_cwd}\") (subpath \"/bin\") (subpath \"/usr/bin\") (subpath \"/usr/lib\") (subpath \"/System/Library\") (subpath \"/Library\")) {write_rule} {network_rule}",
             );
             command.arg("-p").arg(profile).arg(program);
         }

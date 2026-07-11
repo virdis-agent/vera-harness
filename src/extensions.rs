@@ -572,14 +572,28 @@ impl PluginManager {
         if !self.paths.plugins.exists() {
             return Ok(Vec::new());
         }
+        if fs::symlink_metadata(&self.paths.plugins)?
+            .file_type()
+            .is_symlink()
+        {
+            anyhow::bail!("plugin storage directory must not be a symlink");
+        }
         let mut result = Vec::new();
         let mut names = std::collections::BTreeSet::new();
         for entry in fs::read_dir(&self.paths.plugins)? {
             let entry = entry?;
-            if !entry.path().is_dir() {
+            let entry_path = entry.path();
+            let metadata = fs::symlink_metadata(&entry_path)?;
+            if metadata.file_type().is_symlink() {
+                anyhow::bail!(
+                    "plugin directory must not be a symlink: {}",
+                    entry_path.display()
+                );
+            }
+            if !metadata.is_dir() {
                 continue;
             }
-            let manifest = entry.path().join("vera-plugin.toml");
+            let manifest = entry_path.join("vera-plugin.toml");
             if manifest.exists() {
                 let value: PluginManifest = toml::from_str(&fs::read_to_string(manifest)?)?;
                 value.validate()?;
@@ -593,6 +607,15 @@ impl PluginManager {
     }
 
     pub fn add_local(&self, source: &Path) -> Result<PluginManifest> {
+        if !self.paths.plugins.exists() {
+            fs::create_dir_all(&self.paths.plugins)?;
+        }
+        if fs::symlink_metadata(&self.paths.plugins)?
+            .file_type()
+            .is_symlink()
+        {
+            anyhow::bail!("plugin storage directory must not be a symlink");
+        }
         let manifest_path = source.join("vera-plugin.toml");
         if fs::symlink_metadata(&manifest_path)?
             .file_type()
@@ -606,6 +629,9 @@ impl PluginManager {
         manifest.validate()?;
         let destination = self.paths.plugins.join(&manifest.name);
         if destination.exists() {
+            if fs::symlink_metadata(&destination)?.file_type().is_symlink() {
+                anyhow::bail!("plugin destination must not be a symlink");
+            }
             fs::remove_dir_all(&destination)?;
         }
         copy_tree(source, &destination)?;
@@ -615,6 +641,13 @@ impl PluginManager {
     pub fn remove(&self, name: &str) -> Result<()> {
         if name.contains('/') || name.contains("..") {
             anyhow::bail!("invalid plugin name");
+        }
+        if self.paths.plugins.exists()
+            && fs::symlink_metadata(&self.paths.plugins)?
+                .file_type()
+                .is_symlink()
+        {
+            anyhow::bail!("plugin storage directory must not be a symlink");
         }
         let path = self.paths.plugins.join(name);
         if path.exists() {
