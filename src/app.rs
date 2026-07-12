@@ -1420,16 +1420,6 @@ async fn run_interactive(
             &plugins,
             &configured_prompt_roots(paths, root, &config),
         )?;
-        let instructions = context
-            .instructions
-            .iter()
-            .map(|path| {
-                path.strip_prefix(root).map_or_else(
-                    |_| path.display().to_string(),
-                    |relative| relative.display().to_string(),
-                )
-            })
-            .collect::<Vec<_>>();
         let skill_names = context
             .skills
             .iter()
@@ -1468,9 +1458,7 @@ async fn run_interactive(
             &Dashboard {
                 version: env!("CARGO_PKG_VERSION"),
                 root: &root_path,
-                instructions: &instructions,
                 skills: &skill_names,
-                prompts: &prompt_catalog.names().cloned().collect::<Vec<_>>(),
                 extensions: &extensions,
                 mcp_servers,
                 mcp_available: available_mcp.len(),
@@ -2039,9 +2027,7 @@ async fn run_interactive(
             &Dashboard {
                 version: env!("CARGO_PKG_VERSION"),
                 root: &root_path,
-                instructions: &instructions,
                 skills: &skill_names,
-                prompts: &prompt_catalog.names().cloned().collect::<Vec<_>>(),
                 extensions: &extensions,
                 mcp_servers,
                 mcp_available: available_mcp.len(),

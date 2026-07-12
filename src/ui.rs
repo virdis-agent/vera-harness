@@ -23,9 +23,7 @@ use crate::sessions::{DisplayMode, Message};
 pub struct Dashboard<'a> {
     pub version: &'a str,
     pub root: &'a PathBuf,
-    pub instructions: &'a [String],
     pub skills: &'a [String],
-    pub prompts: &'a [String],
     pub extensions: &'a [String],
     pub mcp_servers: usize,
     pub mcp_available: usize,
@@ -150,9 +148,7 @@ pub fn render_dashboard(dashboard: &Dashboard<'_>, state: &UiState) -> Result<Da
         format!("repo: {}", dashboard.root.display()).with(MUTED)
     );
 
-    section("Context", dashboard.instructions, width);
     section("Skills", dashboard.skills, width);
-    section("Prompts", dashboard.prompts, width);
     section("Extensions", dashboard.extensions, width);
     println!();
 
@@ -184,16 +180,6 @@ pub fn render_dashboard(dashboard: &Dashboard<'_>, state: &UiState) -> Result<Da
             );
         }
     }
-    println!(
-        "{}",
-        format!(
-            "MCP: {}/{} server{} active",
-            dashboard.mcp_servers,
-            dashboard.mcp_available,
-            if dashboard.mcp_servers == 1 { "" } else { "s" }
-        )
-        .with(TEAL)
-    );
     println!();
 
     let line = "─".repeat(width.saturating_sub(1).max(23));
