@@ -1196,8 +1196,7 @@ async fn run_headless(
     registry.set_subagent_runner(Arc::new(InProcessSubagentRunner::new(
         Arc::new(provider.clone()),
         paths.clone(),
-        model_info.id.clone(),
-        model_info.context_window,
+        model_info.clone(),
         registry.clone(),
         policy.clone(),
         config.shell_timeout_seconds,
@@ -1245,6 +1244,7 @@ async fn run_headless(
                 session.plan_context()
             ),
             effort,
+            use_responses_lite: model_info.use_responses_lite,
         },
         AgentRunContext {
             registry: &registry,
@@ -1995,8 +1995,7 @@ async fn run_interactive(
         registry.set_subagent_runner(Arc::new(InProcessSubagentRunner::new(
             Arc::new(provider.clone()),
             paths.clone(),
-            config.model.clone(),
-            model_info.context_window,
+            model_info.clone(),
             registry.clone(),
             policy.clone(),
             config.shell_timeout_seconds,
@@ -2059,6 +2058,7 @@ async fn run_interactive(
                         .as_deref()
                         .or(config.effort.as_deref()),
                 )?,
+                use_responses_lite: model_info.use_responses_lite,
             },
             AgentRunContext {
                 registry: &registry,
@@ -2625,6 +2625,7 @@ mod tests {
             context_window,
             default_effort: Some("medium".into()),
             supported_efforts: vec!["low".into(), "medium".into(), "high".into()],
+            use_responses_lite: false,
             source: "fixture".into(),
         }
     }
@@ -2851,6 +2852,7 @@ mod tests {
                 tools: registry.schemas(),
                 instructions: "fixture".into(),
                 effort: None,
+                use_responses_lite: false,
             },
             AgentRunContext {
                 registry: &registry,
@@ -2884,6 +2886,7 @@ mod tests {
                 tools: registry.schemas(),
                 instructions: "fixture".into(),
                 effort: None,
+                use_responses_lite: false,
             },
             AgentRunContext {
                 registry: &registry,
@@ -2936,6 +2939,7 @@ mod tests {
                 tools: registry.schemas(),
                 instructions: "fixture".into(),
                 effort: None,
+                use_responses_lite: false,
             },
             AgentRunContext {
                 registry: &registry,
