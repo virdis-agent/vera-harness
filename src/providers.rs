@@ -326,7 +326,7 @@ impl ResponsesProvider {
             .iter()
             .filter_map(|tool| match (self.kind, tool.name.as_str()) {
                 (ProviderKind::OpenaiCodex, "web_search") => {
-                    Some(json!({"type":"web_search_preview"}))
+                    Some(json!({"type":"web_search"}))
                 }
                 (ProviderKind::OpenaiCodex, "x_search") => None,
                 (ProviderKind::XaiOauth, "web_search") => None,
@@ -988,8 +988,17 @@ mod tests {
 
         let openai = provider(ProviderKind::OpenaiCodex).body(&request);
         assert_eq!(openai["tools"].as_array().unwrap().len(), 2);
-        assert!(
+        assert_eq!(
             openai["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|tool| tool["type"] == "web_search")
+                .count(),
+            1
+        );
+        assert!(
+            !openai["tools"]
                 .as_array()
                 .unwrap()
                 .iter()
