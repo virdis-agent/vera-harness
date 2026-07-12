@@ -127,7 +127,7 @@ pub fn render_dashboard(dashboard: &Dashboard<'_>, state: &UiState) -> Result<Da
     let mut stdout = io::stdout();
     let (terminal_width, terminal_height) = terminal::size().unwrap_or((100, 40));
     let width = terminal_width as usize;
-    execute!(stdout, Clear(ClearType::All), MoveTo(0, 0))?;
+    execute!(stdout, ResetColor, Clear(ClearType::All), MoveTo(0, 0))?;
 
     println!(
         "{} {}",
@@ -152,7 +152,8 @@ pub fn render_dashboard(dashboard: &Dashboard<'_>, state: &UiState) -> Result<Da
     section("Extensions", dashboard.extensions, width);
     println!();
 
-    let transcript = transcript_lines(dashboard.messages, width.saturating_sub(2).max(20));
+    let content_width = terminal_content_width(width);
+    let transcript = transcript_lines(dashboard.messages, content_width.saturating_sub(2).max(20));
     if !transcript.is_empty() {
         let current_row = cursor::position().map(|(_, row)| row).unwrap_or(0);
         let reserved = 5_u16;
@@ -182,7 +183,7 @@ pub fn render_dashboard(dashboard: &Dashboard<'_>, state: &UiState) -> Result<Da
     }
     println!();
 
-    let line = "─".repeat(width.saturating_sub(1).max(23));
+    let line = "─".repeat(content_width);
 
     let percent = if dashboard.context_limit == 0 {
         0.0
@@ -204,7 +205,7 @@ pub fn render_dashboard(dashboard: &Dashboard<'_>, state: &UiState) -> Result<Da
         "({}) {} • {}",
         dashboard.provider, dashboard.model, dashboard.effort
     );
-    let footer_line = fit_status_line(&footer_left, &footer_right, width);
+    let footer_line = fit_status_line(&footer_left, &footer_right, content_width);
     let interactive = stdout.is_terminal();
     let input_bg = adaptive_input_background();
     if interactive {
@@ -230,7 +231,7 @@ pub fn render_dashboard(dashboard: &Dashboard<'_>, state: &UiState) -> Result<Da
     } else {
         (0, 0)
     };
-    let output_row = prompt_row.saturating_add(5);
+    let output_row = clamped_output_row(prompt_row, terminal_height);
     if interactive {
         execute!(
             stdout,
@@ -252,7 +253,7 @@ pub fn render_dashboard(dashboard: &Dashboard<'_>, state: &UiState) -> Result<Da
             },
             true,
         );
-        execute!(stdout, RestorePosition, SetBackgroundColor(input_bg))?;
+        execute!(stdout, RestorePosition, ResetColor)?;
         stdout.flush()?;
     }
     Ok(DashboardFrame {
@@ -336,19 +337,60 @@ pub fn read_chat_input(ctrl_c_pending: &mut bool, state: &mut UiState) -> Result
         return Ok(InputAction::Submit(line));
     }
 
-    terminal::enable_raw_mode()?;
-    if let Err(error) = execute!(io::stdout(), EnableBracketedPaste) {
-        terminal::disable_raw_mode()?;
-        return Err(error.into());
-    }
+    let guard = TerminalInputGuard::enter()?;
     let result = read_raw_input(ctrl_c_pending, state);
-    let paste_disable = execute!(io::stdout(), DisableBracketedPaste);
-    let raw_disable = terminal::disable_raw_mode();
-    match (result, paste_disable, raw_disable) {
-        (Ok(action), Ok(()), Ok(())) => Ok(action),
-        (Err(error), _, _) => Err(error),
-        (_, Err(error), _) => Err(error.into()),
-        (_, _, Err(error)) => Err(error.into()),
+    let cleanup = guard.finish();
+    match (result, cleanup) {
+        (Ok(action), Ok(())) => Ok(action),
+        (Err(error), _) => Err(error),
+        (_, Err(error)) => Err(error),
+    }
+}
+
+struct TerminalInputGuard {
+    raw_mode: bool,
+    bracketed_paste: bool,
+}
+
+impl TerminalInputGuard {
+    fn enter() -> Result<Self> {
+        terminal::enable_raw_mode()?;
+        let mut guard = Self {
+            raw_mode: true,
+            bracketed_paste: false,
+        };
+        execute!(io::stdout(), EnableBracketedPaste, ResetColor)?;
+        guard.bracketed_paste = true;
+        Ok(guard)
+    }
+
+    fn finish(mut self) -> Result<()> {
+        let terminal_result = self.restore();
+        self.raw_mode = false;
+        self.bracketed_paste = false;
+        terminal_result
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        let output_result = if self.bracketed_paste {
+            execute!(io::stdout(), DisableBracketedPaste, ResetColor).map_err(anyhow::Error::from)
+        } else {
+            execute!(io::stdout(), ResetColor).map_err(anyhow::Error::from)
+        };
+        self.bracketed_paste = false;
+        let raw_result = if self.raw_mode {
+            terminal::disable_raw_mode().map_err(anyhow::Error::from)
+        } else {
+            Ok(())
+        };
+        self.raw_mode = false;
+        output_result.and(raw_result)
+    }
+}
+
+impl Drop for TerminalInputGuard {
+    fn drop(&mut self) {
+        let _ = self.restore();
     }
 }
 
@@ -555,7 +597,11 @@ fn redraw_draft(stdout: &mut io::Stdout, prompt_row: u16, state: &UiState) -> Re
         Clear(ClearType::CurrentLine)
     )?;
     write!(stdout, "  {} {visible}", "›".with(TEAL))?;
-    execute!(stdout, MoveTo((4 + cursor_column) as u16, prompt_row))?;
+    execute!(
+        stdout,
+        MoveTo((4 + cursor_column) as u16, prompt_row),
+        ResetColor
+    )?;
     stdout.flush()?;
     Ok(())
 }
@@ -680,6 +726,16 @@ fn fit_status_line(left: &str, right: &str, width: usize) -> String {
     truncate_width(left, width)
 }
 
+fn terminal_content_width(terminal_width: usize) -> usize {
+    terminal_width.saturating_sub(1).max(1)
+}
+
+fn clamped_output_row(prompt_row: u16, terminal_height: u16) -> u16 {
+    prompt_row
+        .saturating_add(5)
+        .min(terminal_height.saturating_sub(1))
+}
+
 fn truncate_width(value: &str, width: usize) -> String {
     if value.width() <= width {
         return value.to_owned();
@@ -801,8 +857,8 @@ fn wrap(entries: &[String], width: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        InputAction, fit_status_line, format_tokens, mode_color, transcript_lines, truncate_width,
-        visible_input, wrap,
+        InputAction, clamped_output_row, fit_status_line, format_tokens, mode_color,
+        terminal_content_width, transcript_lines, truncate_width, visible_input, wrap,
     };
     use crate::safety::PermissionMode;
     use crate::sessions::Message;
@@ -884,5 +940,19 @@ mod tests {
         let (visible, cursor) = visible_input(&input, input.len(), 5);
         assert!(unicode_width::UnicodeWidthStr::width(visible.as_str()) <= 5);
         assert!(cursor <= 4);
+    }
+
+    #[test]
+    fn full_width_content_does_not_trigger_terminal_auto_wrap() {
+        assert_eq!(terminal_content_width(80), 79);
+        assert_eq!(terminal_content_width(1), 1);
+        assert_eq!(terminal_content_width(0), 1);
+    }
+
+    #[test]
+    fn output_stays_inside_short_terminal() {
+        assert_eq!(clamped_output_row(10, 12), 11);
+        assert_eq!(clamped_output_row(2, 24), 7);
+        assert_eq!(clamped_output_row(u16::MAX, 0), 0);
     }
 }
