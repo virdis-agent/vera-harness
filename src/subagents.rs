@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::events::{Event, EventSink};
 use crate::paths::VeraPaths;
-use crate::providers::{Provider, ProviderInput, ProviderRequest, ToolSchema};
+use crate::providers::{ModelInfo, Provider, ProviderInput, ProviderRequest, ToolSchema};
 use crate::safety::{
     ApprovalChoice, ApprovalHandler, PathGuard, PermissionKind, PermissionMode, PermissionPolicy,
 };
@@ -428,6 +428,7 @@ pub struct InProcessSubagentRunner {
     paths: VeraPaths,
     model: String,
     context_window: usize,
+    use_responses_lite: bool,
     registry: ToolRegistry,
     policy: PermissionPolicy,
     shell_timeout: u64,
@@ -437,8 +438,7 @@ impl InProcessSubagentRunner {
     pub fn new(
         provider: Arc<dyn Provider>,
         paths: VeraPaths,
-        model: String,
-        context_window: usize,
+        model: ModelInfo,
         registry: ToolRegistry,
         policy: PermissionPolicy,
         shell_timeout: u64,
@@ -446,8 +446,9 @@ impl InProcessSubagentRunner {
         Self {
             provider,
             paths,
-            model,
-            context_window,
+            model: model.id,
+            context_window: model.context_window,
+            use_responses_lite: model.use_responses_lite,
             registry,
             policy,
             shell_timeout,
@@ -525,6 +526,7 @@ impl SubagentRunner for InProcessSubagentRunner {
                         tools: tools.clone(),
                         instructions: instructions.clone(),
                         effort: None,
+                        use_responses_lite: self.use_responses_lite,
                     },
                     &mut sink,
                 )
@@ -812,6 +814,20 @@ mod tests {
 
     struct MockProvider;
 
+    fn mock_model() -> ModelInfo {
+        ModelInfo {
+            id: "mock-model".into(),
+            display_name: "Mock model".into(),
+            provider: "xai-oauth".into(),
+            order: 0,
+            context_window: 10_000,
+            default_effort: None,
+            supported_efforts: Vec::new(),
+            use_responses_lite: false,
+            source: "fixture".into(),
+        }
+    }
+
     #[async_trait]
     impl Provider for MockProvider {
         fn kind(&self) -> crate::providers::ProviderKind {
@@ -848,8 +864,7 @@ mod tests {
         let runner = InProcessSubagentRunner::new(
             Arc::new(MockProvider),
             paths.clone(),
-            "mock-model".into(),
-            10_000,
+            mock_model(),
             ToolRegistry::standard(),
             PermissionPolicy::default(),
             10,
@@ -883,8 +898,7 @@ mod tests {
         let runner = InProcessSubagentRunner::new(
             Arc::new(MockProvider),
             paths,
-            "mock-model".into(),
-            10_000,
+            mock_model(),
             registry,
             PermissionPolicy::default(),
             10,

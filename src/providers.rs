@@ -19,6 +19,7 @@ use crate::paths::{VeraPaths, set_private_file};
 // Vera's release identity. Keep it aligned with the official Codex catalog
 // schema Vera has validated and can safely consume.
 const OPENAI_CODEX_MODEL_CLIENT_VERSION: &str = "0.144.1";
+const OPENAI_CODEX_RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -140,6 +141,8 @@ pub struct ModelInfo {
     pub default_effort: Option<String>,
     #[serde(default)]
     pub supported_efforts: Vec<String>,
+    #[serde(default)]
+    pub use_responses_lite: bool,
     pub source: String,
 }
 
@@ -203,6 +206,7 @@ pub struct ProviderRequest {
     pub tools: Vec<ToolSchema>,
     pub instructions: String,
     pub effort: Option<String>,
+    pub use_responses_lite: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -280,13 +284,30 @@ impl ResponsesProvider {
     }
 
     fn body(&self, request: &ProviderRequest) -> Value {
+        let responses_lite = self.kind == ProviderKind::OpenaiCodex && request.use_responses_lite;
         let input: Vec<Value> = request
             .input
             .iter()
             .map(|item| match item {
-                ProviderInput::Message { role, content } => {
-                    json!({"role":role,"content":content})
-                }
+                ProviderInput::Message { role, content } if responses_lite => json!({
+                    "type": "message",
+                    "role": role,
+                    "content": [{"type":"input_text","text":content}]
+                }),
+                ProviderInput::Message { role, content } => json!({"role":role,"content":content}),
+                ProviderInput::ImageMessage {
+                    role,
+                    text,
+                    mime_type,
+                    data_base64,
+                } if responses_lite => json!({
+                    "type": "message",
+                    "role": role,
+                    "content": [
+                        {"type":"input_text","text":text},
+                        {"type":"input_image","image_url":format!("data:{mime_type};base64,{data_base64}")}
+                    ]
+                }),
                 ProviderInput::ImageMessage {
                     role,
                     text,
@@ -311,6 +332,47 @@ impl ResponsesProvider {
                 }
             })
             .collect();
+        let tools = request
+            .tools
+            .iter()
+            .filter_map(|tool| match (self.kind, tool.name.as_str()) {
+                (ProviderKind::OpenaiCodex, "web_search") if !responses_lite => {
+                    Some(json!({"type":"web_search"}))
+                }
+                (ProviderKind::OpenaiCodex, "web_search") => None,
+                (ProviderKind::OpenaiCodex, "x_search") => None,
+                (ProviderKind::XaiOauth, "web_search") => None,
+                (ProviderKind::XaiOauth, "x_search") => Some(json!({"type":"x_search"})),
+                _ => Some(json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.parameters})),
+            })
+            .collect::<Vec<_>>();
+        if responses_lite {
+            let mut lite_input = vec![json!({
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": tools
+            })];
+            if !request.instructions.is_empty() {
+                lite_input.push(json!({
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type":"input_text","text":request.instructions}]
+                }));
+            }
+            lite_input.extend(input);
+            let mut body = json!({
+                "model": request.model,
+                "input": lite_input,
+                "parallel_tool_calls": false,
+                "stream": true,
+                "store": false
+            });
+            body["reasoning"] = match &request.effort {
+                Some(effort) => json!({"effort":effort,"context":"all_turns"}),
+                None => json!({"context":"all_turns"}),
+            };
+            return body;
+        }
         let mut body = json!({
             "model": request.model,
             "instructions": request.instructions,
@@ -321,23 +383,24 @@ impl ResponsesProvider {
         if let Some(effort) = &request.effort {
             body["reasoning"] = json!({"effort": effort});
         }
-        let tools = request
-            .tools
-            .iter()
-            .filter_map(|tool| match (self.kind, tool.name.as_str()) {
-                (ProviderKind::OpenaiCodex, "web_search") => {
-                    Some(json!({"type":"web_search"}))
-                }
-                (ProviderKind::OpenaiCodex, "x_search") => None,
-                (ProviderKind::XaiOauth, "web_search") => None,
-                (ProviderKind::XaiOauth, "x_search") => Some(json!({"type":"x_search"})),
-                _ => Some(json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.parameters})),
-            })
-            .collect::<Vec<_>>();
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
         }
         body
+    }
+
+    fn response_request(&self, request: &ProviderRequest) -> reqwest::RequestBuilder {
+        let builder = self
+            .http
+            .post(self.endpoint())
+            .header(CONTENT_TYPE, "application/json")
+            .json(&self.body(request));
+        let builder = self.add_auth_headers(builder);
+        if self.kind == ProviderKind::OpenaiCodex && request.use_responses_lite {
+            builder.header(OPENAI_CODEX_RESPONSES_LITE_HEADER, "true")
+        } else {
+            builder
+        }
     }
 
     pub fn supports_image_input(&self) -> bool {
@@ -371,13 +434,11 @@ impl Provider for ResponsesProvider {
         {
             return Err(VeraError::Provider("provider does not support image input".into()).into());
         }
-        let builder = self
-            .http
-            .post(self.endpoint())
-            .header(CONTENT_TYPE, "application/json")
-            .json(&self.body(&request));
-        let builder = self.add_auth_headers(builder);
-        let response = builder.send().await.context("provider request")?;
+        let response = self
+            .response_request(&request)
+            .send()
+            .await
+            .context("provider request")?;
         let expected_origin = match self.kind {
             ProviderKind::OpenaiCodex => "https://chatgpt.com",
             ProviderKind::XaiOauth => "https://api.x.ai",
@@ -673,6 +734,10 @@ pub fn parse_openai_models(body: &Value) -> Result<Vec<ModelInfo>> {
                     .unwrap_or(128_000) as usize,
                 default_effort,
                 supported_efforts: supported,
+                use_responses_lite: item
+                    .get("use_responses_lite")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
                 source: "live".into(),
             })
         })
@@ -718,6 +783,7 @@ pub fn parse_xai_models(body: &Value) -> Result<Vec<ModelInfo>> {
                     .unwrap_or(128_000) as usize,
                 default_effort: effort.default,
                 supported_efforts: effort.supported,
+                use_responses_lite: false,
                 source: "live".into(),
             })
         })
@@ -879,7 +945,7 @@ mod tests {
         let body = serde_json::json!({
             "models": [
                 {"slug":"slow","display_name":"Slow","priority":20,"default_reasoning_level":"high","supported_reasoning_levels":[{"effort":"low","description":"Fast"},{"effort":"high","description":"Deep"}]},
-                {"slug":"fast","display_name":"Fast","priority":1,"context_window":64000,"default_reasoning_level":"minimal","supported_reasoning_levels":["minimal",{"effort":"low"}]}
+                {"slug":"fast","display_name":"Fast","priority":1,"context_window":64000,"default_reasoning_level":"minimal","supported_reasoning_levels":["minimal",{"effort":"low"}],"use_responses_lite":true}
             ]
         });
         let models = parse_openai_models(&body).unwrap();
@@ -888,6 +954,7 @@ mod tests {
         assert_eq!(models[0].context_window, 64_000);
         assert_eq!(models[0].default_effort.as_deref(), Some("minimal"));
         assert_eq!(models[0].supported_efforts, ["minimal", "low"]);
+        assert!(models[0].use_responses_lite);
     }
 
     #[test]
@@ -932,6 +999,7 @@ mod tests {
             tools: Vec::new(),
             instructions: "instructions".into(),
             effort: Some("low".into()),
+            use_responses_lite: false,
         };
         let body = provider.body(&request);
         assert_eq!(body["store"], false);
@@ -984,6 +1052,7 @@ mod tests {
             ],
             instructions: "instructions".into(),
             effort: None,
+            use_responses_lite: false,
         };
 
         let openai = provider(ProviderKind::OpenaiCodex).body(&request);
@@ -1041,6 +1110,74 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|tool| { tool["type"] == "function" && tool["name"] == "read_file" })
+        );
+    }
+
+    #[test]
+    fn openai_responses_lite_uses_catalog_transport_contract() {
+        let provider = ResponsesProvider::new(
+            ProviderKind::OpenaiCodex,
+            TokenRecord {
+                provider: AuthProvider::OpenaiCodex,
+                access_token: "access".into(),
+                refresh_token: None,
+                expires_at: None,
+                account_id: Some("account".into()),
+                token_type: "Bearer".into(),
+                xai_token_endpoint: None,
+            },
+        )
+        .unwrap();
+        let request = ProviderRequest {
+            model: "gpt-5.6-luna".into(),
+            input: vec![ProviderInput::message("user", "hello")],
+            tools: vec![
+                ToolSchema {
+                    name: "web_search".into(),
+                    description: "web".into(),
+                    parameters: json!({"type":"object"}),
+                },
+                ToolSchema {
+                    name: "x_search".into(),
+                    description: "x".into(),
+                    parameters: json!({"type":"object"}),
+                },
+                ToolSchema {
+                    name: "read_file".into(),
+                    description: "read".into(),
+                    parameters: json!({"type":"object"}),
+                },
+            ],
+            instructions: "instructions".into(),
+            effort: Some("low".into()),
+            use_responses_lite: true,
+        };
+
+        let body = provider.body(&request);
+        assert!(body.get("instructions").is_none());
+        assert!(body.get("tools").is_none());
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["reasoning"]["effort"], "low");
+        assert_eq!(body["reasoning"]["context"], "all_turns");
+        assert_eq!(body["input"][0]["type"], "additional_tools");
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][0]["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(body["input"][0]["tools"][0]["type"], "function");
+        assert_eq!(body["input"][0]["tools"][0]["name"], "read_file");
+        assert_eq!(body["input"][1]["type"], "message");
+        assert_eq!(body["input"][1]["role"], "developer");
+        assert_eq!(body["input"][1]["content"][0]["text"], "instructions");
+        assert_eq!(body["input"][2]["type"], "message");
+        assert_eq!(body["input"][2]["role"], "user");
+        assert_eq!(body["input"][2]["content"][0]["text"], "hello");
+
+        let built = provider.response_request(&request).build().unwrap();
+        assert_eq!(
+            built
+                .headers()
+                .get(OPENAI_CODEX_RESPONSES_LITE_HEADER)
+                .unwrap(),
+            "true"
         );
     }
 
@@ -1112,6 +1249,7 @@ mod tests {
             context_window: 128_000,
             default_effort: Some("high".into()),
             supported_efforts: vec!["low".into(), "medium".into(), "high".into()],
+            use_responses_lite: false,
             source: "live".into(),
         };
         cache_models(&paths, ProviderKind::XaiOauth, &[model]).unwrap();
@@ -1146,6 +1284,7 @@ mod tests {
             tools: Vec::new(),
             instructions: String::new(),
             effort: None,
+            use_responses_lite: false,
         };
         let body = provider.body(&request);
         assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
