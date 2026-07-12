@@ -33,10 +33,12 @@ use crate::safety::{
     ApprovalHandler, PathGuard, PermissionEffect, PermissionKind, PermissionMatcher,
     PermissionMode, PermissionPolicy, PermissionRule, TerminalApproval,
 };
-use crate::sessions::{CapabilitySelection, SessionStore};
+use crate::sessions::{CapabilitySelection, DisplayMode, SessionStore};
 use crate::subagents::InProcessSubagentRunner;
 use crate::tools::{ToolCall, ToolContext, ToolRegistry, execute};
-use crate::ui::{Dashboard, InputAction, UiState, read_chat_input, read_input, render_dashboard};
+use crate::ui::{
+    Dashboard, InputAction, Loader, UiState, read_chat_input, read_input, render_dashboard,
+};
 
 pub async fn run(cli: CommandLine) -> Result<()> {
     let paths = VeraPaths::discover()?;
@@ -1178,6 +1180,7 @@ async fn run_headless(
             enabled_plugins: config.enabled_plugins.clone(),
             enabled_mcp: config.enabled_mcp.clone(),
             loaded_skills: Vec::new(),
+            display_mode: DisplayMode::Detailed,
         },
     )?;
     let hooks = active_hooks(config, &plugins);
@@ -1268,6 +1271,7 @@ async fn run_headless(
             session: &mut session,
             output,
             emit_terminal: true,
+            display_mode: DisplayMode::Detailed,
             shell_timeout: config.shell_timeout_seconds,
             hooks: &hooks,
             root,
@@ -1365,6 +1369,7 @@ async fn run_interactive(
                 enabled_plugins: config.enabled_plugins.clone(),
                 enabled_mcp: config.enabled_mcp.clone(),
                 loaded_skills: Vec::new(),
+                display_mode: DisplayMode::Grouped,
             },
         )?
     };
@@ -1477,6 +1482,7 @@ async fn run_interactive(
                 context_estimated: !session.context_display().1,
                 mode: policy.mode(),
                 messages: &session.messages,
+                display_mode: session.selection.display_mode,
             },
             &ui_state,
         )?;
@@ -1517,6 +1523,25 @@ async fn run_interactive(
             "/quit" | "/exit" => break,
             "/help" | "/commands" => {
                 print_interactive_help();
+                None
+            }
+            "/display" => {
+                println!(
+                    "tool display: {} (grouped | minimal | detailed)",
+                    session.selection.display_mode.label()
+                );
+                None
+            }
+            command if command.starts_with("/display ") => {
+                let value = command[9..].trim();
+                let display_mode = DisplayMode::parse(value).with_context(|| {
+                    format!("unknown display mode {value:?}; use grouped, minimal, or detailed")
+                })?;
+                session.set_selection(CapabilitySelection {
+                    display_mode,
+                    ..session.selection.clone()
+                })?;
+                println!("tool display: {}", display_mode.label());
                 None
             }
             "/plan" => {
@@ -2028,6 +2053,7 @@ async fn run_interactive(
                 context_estimated: !session.context_display().1,
                 mode: policy.mode(),
                 messages: &active_messages,
+                display_mode: session.selection.display_mode,
             },
             &ui_state,
         )?;
@@ -2102,6 +2128,7 @@ async fn run_interactive(
             input = continuation;
             input.push(answer);
         }
+        let display_mode = session.selection.display_mode;
         let response = match run_agent_turn(
             &provider,
             ProviderRequest {
@@ -2131,6 +2158,7 @@ async fn run_interactive(
                 session: &mut session,
                 output: OutputFormat::Text,
                 emit_terminal: false,
+                display_mode,
                 shell_timeout: config.shell_timeout_seconds,
                 hooks: &hooks,
                 root,
@@ -2366,7 +2394,7 @@ fn print_help() {
 
 fn print_interactive_help() {
     println!(
-        "shift+tab cycle modes  /plan  /confirm  /auto  /yolo  /provider <id>  /models  /model [<id>]  /effort [<level>]  /permissions [deny|ask|allow] <kind>  /processes  /compact  /context  /diff  /undo  /resume <id>  /skills  /skill load|unload <name>  /prompts  /prompt <name> [args]  /extensions  /extension enable|disable <name>  /mcp enable|disable <name>  /agents  /agent <id>  /quit"
+        "shift+tab cycle modes  /display [grouped|minimal|detailed]  /plan  /confirm  /auto  /yolo  /provider <id>  /models  /model [<id>]  /effort [<level>]  /permissions [deny|ask|allow] <kind>  /processes  /compact  /context  /diff  /undo  /resume <id>  /skills  /skill load|unload <name>  /prompts  /prompt <name> [args]  /extensions  /extension enable|disable <name>  /mcp enable|disable <name>  /agents  /agent <id>  /quit"
     );
 }
 
@@ -2393,14 +2421,16 @@ struct AgentSink {
     terminal: TerminalEventSink,
     emit_terminal: bool,
     calls: std::collections::BTreeMap<String, PendingToolCall>,
+    loader: Loader,
 }
 
 impl AgentSink {
-    fn new(output: OutputFormat, emit_terminal: bool) -> Self {
+    fn new(output: OutputFormat, emit_terminal: bool, display_mode: DisplayMode) -> Self {
         Self {
-            terminal: TerminalEventSink::new(output),
+            terminal: TerminalEventSink::with_display(output, display_mode),
             emit_terminal,
             calls: std::collections::BTreeMap::new(),
+            loader: Loader::start("Working", !emit_terminal),
         }
     }
 }
@@ -2408,6 +2438,7 @@ impl AgentSink {
 #[async_trait::async_trait]
 impl EventSink for AgentSink {
     async fn emit(&mut self, event: Event) -> Result<()> {
+        self.loader.stop();
         if let Event::ToolCallDelta {
             id,
             name,
@@ -2439,6 +2470,7 @@ struct AgentRunContext<'a> {
     session: &'a mut crate::sessions::Session,
     output: OutputFormat,
     emit_terminal: bool,
+    display_mode: DisplayMode,
     shell_timeout: u64,
     hooks: &'a [HookSpec],
     root: &'a Path,
@@ -2497,7 +2529,7 @@ async fn run_agent_turn_inner(
         // dashboard can label a full-request local estimate. A later provider
         // usage event replaces it as authoritative.
         context.session.record_estimate(local_estimate)?;
-        let mut sink = AgentSink::new(context.output, context.emit_terminal);
+        let mut sink = AgentSink::new(context.output, context.emit_terminal, context.display_mode);
         let result = provider.stream(request.clone(), &mut sink).await?;
         if result.input_tokens > 0 {
             context.session.record_usage(
@@ -2530,6 +2562,7 @@ async fn run_agent_turn_inner(
                 context.approval,
             )
             .await?;
+            sink.terminal.tool_started(&id, tool_name, &arguments)?;
             let image_capability_error = !provider.supports_image_input()
                 && matches!(tool_name, "image_inspect" | "browser_screenshot");
             let tool_result = if image_capability_error {
@@ -2563,6 +2596,12 @@ async fn run_agent_turn_inner(
             } else {
                 crate::tools::ToolResult::complete(format!("unknown tool {tool_name}"), true)
             };
+            sink.terminal.tool_finished(
+                &id,
+                tool_name,
+                &tool_result.content(),
+                tool_result.is_error(),
+            )?;
             let image_input = if tool_result.is_error() {
                 None
             } else {
@@ -2933,6 +2972,7 @@ mod tests {
                 session: &mut session,
                 output: OutputFormat::Jsonl,
                 emit_terminal: true,
+                display_mode: DisplayMode::Detailed,
                 shell_timeout: 10,
                 hooks: &[],
                 root: &root,
@@ -2968,6 +3008,7 @@ mod tests {
                 session: &mut session,
                 output: OutputFormat::Jsonl,
                 emit_terminal: true,
+                display_mode: DisplayMode::Detailed,
                 shell_timeout: 10,
                 hooks: &[],
                 root: &root,
@@ -3022,6 +3063,7 @@ mod tests {
                 session: &mut session,
                 output: OutputFormat::Jsonl,
                 emit_terminal: true,
+                display_mode: DisplayMode::Detailed,
                 shell_timeout: 10,
                 hooks: &[],
                 root: &root,

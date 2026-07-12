@@ -1,17 +1,24 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::{
-    cursor::{self, MoveTo, RestorePosition, SavePosition},
-    event::{self, Event, KeyCode, KeyModifiers},
+    cursor::{self, MoveTo, MoveToColumn, RestorePosition, SavePosition},
+    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyModifiers},
     execute,
-    style::{Color, Stylize},
+    style::{Color, ResetColor, SetBackgroundColor, Stylize},
     terminal::{self, Clear, ClearType},
 };
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::safety::PermissionMode;
-use crate::sessions::Message;
+use crate::sessions::{DisplayMode, Message};
 
 pub struct Dashboard<'a> {
     pub version: &'a str,
@@ -30,11 +37,16 @@ pub struct Dashboard<'a> {
     pub context_estimated: bool,
     pub mode: PermissionMode,
     pub messages: &'a [Message],
+    pub display_mode: DisplayMode,
 }
 
 #[derive(Default)]
 pub struct UiState {
     pub draft: String,
+    cursor_index: usize,
+    history: Vec<String>,
+    history_index: Option<usize>,
+    history_draft: String,
     /// Number of wrapped transcript lines hidden below the viewport.
     pub scroll_offset: usize,
 }
@@ -83,7 +95,9 @@ pub struct DashboardFrame {
     line: String,
     footer_line: String,
     mcp_servers: usize,
+    mcp_available: usize,
     mode: PermissionMode,
+    display_mode: DisplayMode,
     output_row: u16,
     interactive: bool,
 }
@@ -92,13 +106,17 @@ impl DashboardFrame {
     pub fn finish_input(self) -> Result<()> {
         let mut stdout = io::stdout();
         if self.interactive {
-            execute!(stdout, MoveTo(0, self.output_row))?;
+            execute!(stdout, ResetColor, MoveTo(0, self.output_row))?;
         } else {
             draw_decorations(
-                &self.line,
-                &self.footer_line,
-                self.mcp_servers,
-                self.mode,
+                Decorations {
+                    line: &self.line,
+                    footer_line: &self.footer_line,
+                    mcp_servers: self.mcp_servers,
+                    mcp_available: self.mcp_available,
+                    mode: self.mode,
+                    display_mode: self.display_mode,
+                },
                 false,
             );
         }
@@ -178,7 +196,7 @@ pub fn render_dashboard(dashboard: &Dashboard<'_>, state: &UiState) -> Result<Da
     );
     println!();
 
-    let line = "─".repeat(width.max(24));
+    let line = "─".repeat(width.saturating_sub(1).max(23));
 
     let percent = if dashboard.context_limit == 0 {
         0.0
@@ -191,74 +209,116 @@ pub fn render_dashboard(dashboard: &Dashboard<'_>, state: &UiState) -> Result<Da
         "provider"
     };
     let footer_left = format!(
-        "$0.000 (sub)  {}/{}k ({estimate}, {:.1}%)",
-        dashboard.context_tokens,
-        dashboard.context_limit / 1_000,
+        "{} / {} ({estimate}, {:.1}%)",
+        format_tokens(dashboard.context_tokens),
+        format_tokens(dashboard.context_limit),
         percent
     );
     let footer_right = format!(
         "({}) {} • {}",
         dashboard.provider, dashboard.model, dashboard.effort
     );
-    let footer_gap = width.saturating_sub(footer_left.len() + footer_right.len());
-    let footer_line = format!("{}{}{}", footer_left, " ".repeat(footer_gap), footer_right);
+    let footer_line = fit_status_line(&footer_left, &footer_right, width);
     let interactive = stdout.is_terminal();
+    let input_bg = adaptive_input_background();
     if interactive {
-        println!("{}", line.clone().with(mode_color(dashboard.mode)));
+        execute!(
+            stdout,
+            SetBackgroundColor(input_bg),
+            Clear(ClearType::CurrentLine)
+        )?;
+        println!();
+        execute!(
+            stdout,
+            SetBackgroundColor(input_bg),
+            Clear(ClearType::CurrentLine)
+        )?;
+        print!("  {} {}", "›".with(mode_color(dashboard.mode)), state.draft);
     } else {
         println!("{line}");
+        print!("{}{}", "> ".with(mode_color(dashboard.mode)), state.draft);
     }
-    print!("{}{}", "> ".with(mode_color(dashboard.mode)), state.draft);
     stdout.flush()?;
     let (_, prompt_row) = if interactive {
         cursor::position()?
     } else {
         (0, 0)
     };
-    let output_row = prompt_row.saturating_add(4);
+    let output_row = prompt_row.saturating_add(5);
     if interactive {
         execute!(
             stdout,
             SavePosition,
-            MoveTo(0, prompt_row.saturating_add(1))
+            MoveTo(0, prompt_row.saturating_add(1)),
+            SetBackgroundColor(input_bg),
+            Clear(ClearType::CurrentLine)
         )?;
+        println!();
+        execute!(stdout, ResetColor)?;
         draw_decorations(
-            &line,
-            &footer_line,
-            dashboard.mcp_servers,
-            dashboard.mode,
+            Decorations {
+                line: &line,
+                footer_line: &footer_line,
+                mcp_servers: dashboard.mcp_servers,
+                mcp_available: dashboard.mcp_available,
+                mode: dashboard.mode,
+                display_mode: dashboard.display_mode,
+            },
             true,
         );
-        execute!(stdout, RestorePosition)?;
+        execute!(stdout, RestorePosition, SetBackgroundColor(input_bg))?;
         stdout.flush()?;
     }
     Ok(DashboardFrame {
         line,
         footer_line,
         mcp_servers: dashboard.mcp_servers,
+        mcp_available: dashboard.mcp_available,
         mode: dashboard.mode,
+        display_mode: dashboard.display_mode,
         output_row,
         interactive,
     })
 }
 
-fn draw_decorations(
-    line: &str,
-    footer_line: &str,
+struct Decorations<'a> {
+    line: &'a str,
+    footer_line: &'a str,
     mcp_servers: usize,
+    mcp_available: usize,
     mode: PermissionMode,
-    colored: bool,
-) {
+    display_mode: DisplayMode,
+}
+
+fn draw_decorations(decorations: Decorations<'_>, colored: bool) {
+    let Decorations {
+        line,
+        footer_line,
+        mcp_servers,
+        mcp_available,
+        mode,
+        display_mode,
+    } = decorations;
     if colored {
         let color = mode_color(mode);
         println!("{}", line.with(color));
         println!("{}", footer_line.with(MUTED));
-        print!("{} ", format!("MCP: {mcp_servers}/4 servers").with(TEAL));
-        println!("{}", format!("⏵ {}", mode.label()).with(color));
+        print!(
+            "{} ",
+            format!("MCP: {mcp_servers}/{mcp_available}").with(TEAL)
+        );
+        println!(
+            "{}",
+            format!("⏵ {} · tools {}", mode.label(), display_mode.label()).with(color)
+        );
     } else {
         println!("{line}");
         println!("{footer_line}");
-        println!("MCP: {mcp_servers} active ⏵ {}", mode.label());
+        println!(
+            "MCP: {mcp_servers}/{mcp_available} ⏵ {} · tools {}",
+            mode.label(),
+            display_mode.label()
+        );
     }
 }
 
@@ -291,20 +351,31 @@ pub fn read_chat_input(ctrl_c_pending: &mut bool, state: &mut UiState) -> Result
     }
 
     terminal::enable_raw_mode()?;
+    if let Err(error) = execute!(io::stdout(), EnableBracketedPaste) {
+        terminal::disable_raw_mode()?;
+        return Err(error.into());
+    }
     let result = read_raw_input(ctrl_c_pending, state);
-    terminal::disable_raw_mode()?;
-    result
+    let paste_disable = execute!(io::stdout(), DisableBracketedPaste);
+    let raw_disable = terminal::disable_raw_mode();
+    match (result, paste_disable, raw_disable) {
+        (Ok(action), Ok(()), Ok(())) => Ok(action),
+        (Err(error), _, _) => Err(error),
+        (_, Err(error), _) => Err(error.into()),
+        (_, _, Err(error)) => Err(error.into()),
+    }
 }
 
 fn read_raw_input(ctrl_c_pending: &mut bool, state: &mut UiState) -> Result<InputAction> {
     let mut stdout = io::stdout();
+    state.cursor_index = state.cursor_index.min(state.draft.chars().count());
+    let prompt_row = cursor::position()?.1;
     loop {
         match event::read()? {
             Event::Paste(text) => {
                 *ctrl_c_pending = false;
-                state.draft.push_str(&text);
-                print!("{text}");
-                stdout.flush()?;
+                insert_at_cursor(state, &text.replace(['\r', '\n'], " "));
+                redraw_draft(&mut stdout, prompt_row, state)?;
             }
             Event::Key(key) => {
                 let is_ctrl_c = matches!(key.code, KeyCode::Char('c'))
@@ -320,39 +391,83 @@ fn read_raw_input(ctrl_c_pending: &mut bool, state: &mut UiState) -> Result<Inpu
                         return Ok(InputAction::CycleMode);
                     }
                     KeyCode::Enter => {
-                        print!("\r\n");
-                        stdout.flush()?;
                         state.scroll_offset = 0;
-                        return Ok(InputAction::Submit(std::mem::take(&mut state.draft)));
+                        let submitted = std::mem::take(&mut state.draft);
+                        if !submitted.trim().is_empty() && state.history.last() != Some(&submitted)
+                        {
+                            state.history.push(submitted.clone());
+                        }
+                        state.cursor_index = 0;
+                        state.history_index = None;
+                        state.history_draft.clear();
+                        return Ok(InputAction::Submit(submitted));
                     }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        print!("^C\r\n");
-                        stdout.flush()?;
                         return Ok(handle_ctrl_c(ctrl_c_pending));
                     }
                     KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        print!("\r\n");
-                        stdout.flush()?;
-                        return Ok(InputAction::Exit);
+                        if state.draft.is_empty() {
+                            return Ok(InputAction::Exit);
+                        }
+                        delete_at_cursor(state);
+                        redraw_draft(&mut stdout, prompt_row, state)?;
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        delete_before_cursor(state, true);
+                        redraw_draft(&mut stdout, prompt_row, state)?;
+                    }
+                    KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        delete_word_before_cursor(state);
+                        redraw_draft(&mut stdout, prompt_row, state)?;
                     }
                     KeyCode::Char(character) => {
-                        state.draft.push(character);
-                        print!("{character}");
-                        stdout.flush()?;
+                        insert_at_cursor(state, &character.to_string());
+                        redraw_draft(&mut stdout, prompt_row, state)?;
                     }
                     KeyCode::Backspace => {
-                        if state.draft.pop().is_some() {
-                            print!("\x08 \x08");
-                            stdout.flush()?;
-                        }
+                        delete_before_cursor(state, false);
+                        redraw_draft(&mut stdout, prompt_row, state)?;
+                    }
+                    KeyCode::Delete => {
+                        delete_at_cursor(state);
+                        redraw_draft(&mut stdout, prompt_row, state)?;
+                    }
+                    KeyCode::Left => {
+                        state.cursor_index = state.cursor_index.saturating_sub(1);
+                        redraw_draft(&mut stdout, prompt_row, state)?;
+                    }
+                    KeyCode::Right => {
+                        state.cursor_index =
+                            (state.cursor_index + 1).min(state.draft.chars().count());
+                        redraw_draft(&mut stdout, prompt_row, state)?;
+                    }
+                    KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(InputAction::ScrollTop);
+                    }
+                    KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(InputAction::ScrollBottom);
+                    }
+                    KeyCode::Home => {
+                        state.cursor_index = 0;
+                        redraw_draft(&mut stdout, prompt_row, state)?;
+                    }
+                    KeyCode::End => {
+                        state.cursor_index = state.draft.chars().count();
+                        redraw_draft(&mut stdout, prompt_row, state)?;
+                    }
+                    KeyCode::Up => {
+                        history_up(state);
+                        redraw_draft(&mut stdout, prompt_row, state)?;
+                    }
+                    KeyCode::Down => {
+                        history_down(state);
+                        redraw_draft(&mut stdout, prompt_row, state)?;
                     }
                     KeyCode::Esc => {
                         return Ok(InputAction::Cancel);
                     }
                     KeyCode::PageUp => return Ok(InputAction::ScrollUp),
                     KeyCode::PageDown => return Ok(InputAction::ScrollDown),
-                    KeyCode::Home => return Ok(InputAction::ScrollTop),
-                    KeyCode::End => return Ok(InputAction::ScrollBottom),
                     _ => {}
                 }
             }
@@ -360,6 +475,127 @@ fn read_raw_input(ctrl_c_pending: &mut bool, state: &mut UiState) -> Result<Inpu
             _ => {}
         }
     }
+}
+
+fn insert_at_cursor(state: &mut UiState, value: &str) {
+    let mut chars = state.draft.chars().collect::<Vec<_>>();
+    let inserted = value.chars().collect::<Vec<_>>();
+    chars.splice(
+        state.cursor_index..state.cursor_index,
+        inserted.iter().copied(),
+    );
+    state.cursor_index += inserted.len();
+    state.draft = chars.into_iter().collect();
+}
+
+fn delete_before_cursor(state: &mut UiState, to_start: bool) {
+    let mut chars = state.draft.chars().collect::<Vec<_>>();
+    let start = if to_start {
+        0
+    } else {
+        state.cursor_index.saturating_sub(1)
+    };
+    if start < state.cursor_index {
+        chars.drain(start..state.cursor_index);
+        state.cursor_index = start;
+        state.draft = chars.into_iter().collect();
+    }
+}
+
+fn delete_word_before_cursor(state: &mut UiState) {
+    let mut chars = state.draft.chars().collect::<Vec<_>>();
+    let mut start = state.cursor_index;
+    while start > 0 && chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    while start > 0 && !chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    chars.drain(start..state.cursor_index);
+    state.cursor_index = start;
+    state.draft = chars.into_iter().collect();
+}
+
+fn delete_at_cursor(state: &mut UiState) {
+    let mut chars = state.draft.chars().collect::<Vec<_>>();
+    if state.cursor_index < chars.len() {
+        chars.remove(state.cursor_index);
+        state.draft = chars.into_iter().collect();
+    }
+}
+
+fn history_up(state: &mut UiState) {
+    if state.history.is_empty() {
+        return;
+    }
+    if state.history_index.is_none() {
+        state.history_draft = state.draft.clone();
+    }
+    let index = state
+        .history_index
+        .unwrap_or(state.history.len())
+        .saturating_sub(1);
+    state.history_index = Some(index);
+    state.draft = state.history[index].clone();
+    state.cursor_index = state.draft.chars().count();
+}
+
+fn history_down(state: &mut UiState) {
+    let Some(index) = state.history_index else {
+        return;
+    };
+    if index + 1 < state.history.len() {
+        let next = index + 1;
+        state.history_index = Some(next);
+        state.draft = state.history[next].clone();
+    } else {
+        state.history_index = None;
+        state.draft = state.history_draft.clone();
+    }
+    state.cursor_index = state.draft.chars().count();
+}
+
+fn redraw_draft(stdout: &mut io::Stdout, prompt_row: u16, state: &UiState) -> Result<()> {
+    let width = terminal::size()
+        .map(|(width, _)| width as usize)
+        .unwrap_or(80);
+    let available = width.saturating_sub(5).max(1);
+    let chars = state.draft.chars().collect::<Vec<_>>();
+    let (visible, cursor_column) = visible_input(&chars, state.cursor_index, available);
+    execute!(
+        stdout,
+        MoveTo(0, prompt_row),
+        SetBackgroundColor(adaptive_input_background()),
+        Clear(ClearType::CurrentLine)
+    )?;
+    write!(stdout, "  {} {visible}", "›".with(TEAL))?;
+    execute!(stdout, MoveTo((4 + cursor_column) as u16, prompt_row))?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn visible_input(input: &[char], cursor_index: usize, width: usize) -> (String, usize) {
+    let mut start = cursor_index;
+    let mut cursor_width = 0;
+    while start > 0 {
+        let character_width = input[start - 1].width().unwrap_or(0);
+        if cursor_width + character_width > width.saturating_sub(1) {
+            break;
+        }
+        start -= 1;
+        cursor_width += character_width;
+    }
+    let mut visible = String::new();
+    let mut used = 0;
+    for character in &input[start..] {
+        let character_width = character.width().unwrap_or(0);
+        if used + character_width > width {
+            break;
+        }
+        visible.push(*character);
+        used += character_width;
+    }
+    (visible, cursor_width)
 }
 
 fn transcript_lines(messages: &[Message], width: usize) -> Vec<String> {
@@ -414,6 +650,124 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+fn adaptive_input_background() -> Color {
+    let light = std::env::var("COLORFGBG")
+        .ok()
+        .and_then(|value| value.rsplit(';').next()?.parse::<u8>().ok())
+        .is_some_and(|background| background >= 7 && background != 8);
+    if light {
+        Color::Rgb {
+            r: 238,
+            g: 238,
+            b: 238,
+        }
+    } else {
+        Color::Rgb {
+            r: 42,
+            g: 45,
+            b: 46,
+        }
+    }
+}
+
+fn format_tokens(tokens: usize) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}m", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn fit_status_line(left: &str, right: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let required = left.width() + right.width() + 1;
+    if required <= width {
+        return format!(
+            "{left}{}{right}",
+            " ".repeat(width - left.width() - right.width())
+        );
+    }
+    truncate_width(left, width)
+}
+
+fn truncate_width(value: &str, width: usize) -> String {
+    if value.width() <= width {
+        return value.to_owned();
+    }
+    if width <= 1 {
+        return "…".chars().take(width).collect();
+    }
+    let mut result = String::new();
+    let mut used = 0;
+    for character in value.chars() {
+        let character_width = character.width().unwrap_or(0);
+        if used + character_width > width - 1 {
+            break;
+        }
+        result.push(character);
+        used += character_width;
+    }
+    result.push('…');
+    result
+}
+
+pub struct Loader {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Loader {
+    pub fn start(text: &str, enabled: bool) -> Self {
+        if !enabled || !io::stdout().is_terminal() {
+            return Self {
+                stop: Arc::new(AtomicBool::new(true)),
+                handle: None,
+            };
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let text = text.to_owned();
+        let handle = thread::spawn(move || {
+            const FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let mut index = 0;
+            let mut stdout = io::stdout();
+            while !thread_stop.load(Ordering::Relaxed) {
+                let _ = write!(
+                    stdout,
+                    "\r{}",
+                    format!("{} {text}", FRAMES[index % FRAMES.len()]).with(MUTED)
+                );
+                let _ = stdout.flush();
+                index += 1;
+                thread::sleep(Duration::from_millis(80));
+            }
+            let _ = execute!(stdout, MoveToColumn(0), Clear(ClearType::CurrentLine));
+            let _ = stdout.flush();
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for Loader {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 fn handle_ctrl_c(ctrl_c_pending: &mut bool) -> InputAction {
     if *ctrl_c_pending {
         *ctrl_c_pending = false;
@@ -460,7 +814,10 @@ fn wrap(entries: &[String], width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputAction, mode_color, transcript_lines, wrap};
+    use super::{
+        InputAction, fit_status_line, format_tokens, mode_color, transcript_lines, truncate_width,
+        visible_input, wrap,
+    };
     use crate::safety::PermissionMode;
     use crate::sessions::Message;
 
@@ -517,5 +874,29 @@ mod tests {
             InputAction::Exit
         ));
         assert!(!ctrl_c_pending);
+    }
+
+    #[test]
+    fn token_counts_use_compact_consistent_units() {
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1_250), "1.2k");
+        assert_eq!(format_tokens(2_500_000), "2.5m");
+    }
+
+    #[test]
+    fn status_line_preserves_both_sides_when_they_fit() {
+        let line = fit_status_line("1.2k / 128.0k", "model • high", 40);
+        assert_eq!(unicode_width::UnicodeWidthStr::width(line.as_str()), 40);
+        assert!(line.starts_with("1.2k"));
+        assert!(line.ends_with("model • high"));
+    }
+
+    #[test]
+    fn narrow_status_and_input_are_unicode_width_safe() {
+        assert_eq!(truncate_width("provider/model", 6), "provi…");
+        let input = "abc界def".chars().collect::<Vec<_>>();
+        let (visible, cursor) = visible_input(&input, input.len(), 5);
+        assert!(unicode_width::UnicodeWidthStr::width(visible.as_str()) <= 5);
+        assert!(cursor <= 4);
     }
 }

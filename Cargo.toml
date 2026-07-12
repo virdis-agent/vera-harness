@@ -1,6 +1,6 @@
 [package]
 name = "vera-harness"
-version = "0.1.0-alpha.18"
+version = "0.1.0-alpha.19"
 edition = "2024"
 description = "Vera, a macOS-first coding agent CLI"
 license = "MIT"
@@ -32,6 +32,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 url = "2"
+unicode-width = "0.2"
 uuid = { version = "1", features = ["v4", "serde"] }
 which = "7"
 

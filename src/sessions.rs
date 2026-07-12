@@ -78,6 +78,54 @@ pub struct CapabilitySelection {
     pub enabled_mcp: Vec<String>,
     #[serde(default)]
     pub loaded_skills: Vec<String>,
+    #[serde(default)]
+    pub display_mode: DisplayMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayMode {
+    #[default]
+    Grouped,
+    Minimal,
+    Detailed,
+}
+
+impl DisplayMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "grouped" => Some(Self::Grouped),
+            "minimal" => Some(Self::Minimal),
+            "detailed" => Some(Self::Detailed),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Grouped => "grouped",
+            Self::Minimal => "minimal",
+            Self::Detailed => "detailed",
+        }
+    }
+}
+
+#[cfg(test)]
+mod display_mode_tests {
+    use super::{CapabilitySelection, DisplayMode};
+
+    #[test]
+    fn display_modes_parse_and_legacy_selection_defaults_to_grouped() {
+        assert_eq!(DisplayMode::parse("minimal"), Some(DisplayMode::Minimal));
+        assert_eq!(DisplayMode::parse("verbose"), None);
+        let selection: CapabilitySelection = serde_json::from_value(serde_json::json!({
+            "provider":"openai-codex",
+            "model":"auto",
+            "model_context_window":128000
+        }))
+        .unwrap();
+        assert_eq!(selection.display_mode, DisplayMode::Grouped);
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
