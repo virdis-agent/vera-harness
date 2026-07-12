@@ -398,22 +398,13 @@ fn model_catalog(paths: &VeraPaths) -> Result<ModelCatalog> {
     Ok(catalog)
 }
 
-fn resolve_model(paths: &VeraPaths, provider: ProviderKind, id: &str) -> Result<ModelInfo> {
-    let catalog = model_catalog(paths)?;
-    resolve_model_from_catalog(&catalog, provider, id)
-}
-
 fn resolve_model_from_catalog(
     catalog: &ModelCatalog,
     provider: ProviderKind,
     id: &str,
 ) -> Result<ModelInfo> {
-    let found = if id == "auto" {
-        catalog.default_for(provider)
-    } else {
-        catalog.find(provider, id)
-    };
-    found
+    catalog
+        .find(provider, id)
         .cloned()
         .with_context(|| {
             format!(
@@ -421,6 +412,20 @@ fn resolve_model_from_catalog(
                 provider.as_str()
             )
         })
+}
+
+fn resolve_configured_model_from_catalog(
+    catalog: &ModelCatalog,
+    provider: ProviderKind,
+    id: &str,
+) -> Result<ModelInfo> {
+    if id.is_empty() || id == "auto" {
+        return catalog
+            .default_for(provider)
+            .cloned()
+            .with_context(|| format!("no model catalog for {}", provider.as_str()));
+    }
+    resolve_model_from_catalog(catalog, provider, id)
 }
 
 fn cached_catalog(paths: &VeraPaths, provider: ProviderKind) -> Result<ModelCatalog> {
@@ -825,11 +830,21 @@ fn inspect(paths: &VeraPaths, root: &Path, config: &Config) -> Result<()> {
         &configured_prompt_roots(paths, root, config),
     )?;
     let agents = discover_agents(root, None)?;
+    let provider = ProviderKind::parse(&config.provider)?;
+    let models = model_catalog(paths)?;
+    let model = if config.model.is_empty() {
+        models
+            .default_for(provider)
+            .map(|model| model.id.as_str())
+            .unwrap_or("<provider default>")
+    } else {
+        &config.model
+    };
     println!(
         "root: {}\nprovider: {}\nmodel: {}\n",
         root.display(),
         config.provider,
-        config.model
+        model
     );
     println!("instructions:");
     for path in agents {
@@ -870,7 +885,7 @@ fn inspect(paths: &VeraPaths, root: &Path, config: &Config) -> Result<()> {
         }
     }
     println!("models:");
-    for model in model_catalog(paths)?.for_provider(ProviderKind::parse(&config.provider)?) {
+    for model in models.for_provider(provider) {
         println!("  {}\t{} tokens", model.id, model.context_window);
     }
     println!(
@@ -1149,7 +1164,6 @@ async fn run_headless(
 ) -> Result<()> {
     let provider_name = provider_override.unwrap_or(&config.provider);
     let kind = ProviderKind::parse(provider_name)?;
-    let model = model_override.unwrap_or(&config.model);
     let store = TokenStore::new(paths.clone());
     let token = usable_token(&store, kind).await?.context(format!(
         "not logged in to {}; run vera auth login {}",
@@ -1157,7 +1171,10 @@ async fn run_headless(
         kind.as_str()
     ))?;
     let catalog = provider_catalog_for(paths, kind).await?;
-    let model_info = resolve_model_from_catalog(&catalog, kind, model)?;
+    let model_info = match model_override {
+        Some(model) => resolve_model_from_catalog(&catalog, kind, model)?,
+        None => resolve_configured_model_from_catalog(&catalog, kind, &config.model)?,
+    };
     let effort = resolve_effort(&model_info, effort_override.or(config.effort.as_deref()))?;
     let provider = ResponsesProvider::new(kind, token)?;
     let plugins = enabled_plugins(paths, config, &[])?;
@@ -1354,7 +1371,9 @@ async fn run_interactive(
         config.model = resolve_model_from_catalog(&catalog, provider_kind, &model)?.id;
     }
     config.validate()?;
-    let mut model_info = resolve_model_from_catalog(&catalog, provider_kind, &config.model)?;
+    let mut model_info =
+        resolve_configured_model_from_catalog(&catalog, provider_kind, &config.model)?;
+    config.model = model_info.id.clone();
     let mut session = if let Some(session) = resumed.take() {
         session
     } else {
@@ -1373,6 +1392,13 @@ async fn run_interactive(
             },
         )?
     };
+    if session.settings.model != model_info.id || session.selection.model != model_info.id {
+        session.set_selection(CapabilitySelection {
+            model: model_info.id.clone(),
+            model_context_window: model_info.context_window,
+            ..session.selection.clone()
+        })?;
+    }
     let mut session_plugins = if resume_id.is_some() {
         session.selection.enabled_plugins.clone()
     } else {
@@ -1994,9 +2020,21 @@ async fn run_interactive(
                 config.effort = session.settings.effort.clone();
                 let resumed_kind = ProviderKind::parse(&config.provider)?;
                 let resumed_catalog = provider_catalog_for(paths, resumed_kind).await?;
-                model_info =
-                    resolve_model_from_catalog(&resumed_catalog, resumed_kind, &config.model)?;
+                model_info = resolve_configured_model_from_catalog(
+                    &resumed_catalog,
+                    resumed_kind,
+                    &config.model,
+                )?;
                 config.model = model_info.id.clone();
+                if session.settings.model != model_info.id
+                    || session.selection.model != model_info.id
+                {
+                    session.set_selection(CapabilitySelection {
+                        model: model_info.id.clone(),
+                        model_context_window: model_info.context_window,
+                        ..session.selection.clone()
+                    })?;
+                }
                 session_plugins = session.selection.enabled_plugins.clone();
                 active_mcp = session.selection.enabled_mcp.clone();
                 plugins = enabled_plugins(paths, &config, &session_plugins)?;
@@ -2743,6 +2781,35 @@ mod tests {
         assert!(parse_numbered_selection("0", &choices).is_err());
         assert!(parse_numbered_selection("3", &choices).is_err());
         assert!(parse_numbered_selection("unknown", &choices).is_err());
+    }
+
+    #[test]
+    fn configured_model_defaults_are_compatible_but_auto_is_not_selectable() {
+        let mut preferred = fixture_model("preferred", 32_000);
+        preferred.order = -1;
+        let fallback = fixture_model("fallback", 16_000);
+        let mut catalog = ModelCatalog::default();
+        catalog.merge([fallback, preferred]);
+
+        assert_eq!(
+            resolve_configured_model_from_catalog(&catalog, ProviderKind::OpenaiCodex, "",)
+                .unwrap()
+                .id,
+            "preferred"
+        );
+        assert_eq!(
+            resolve_configured_model_from_catalog(&catalog, ProviderKind::OpenaiCodex, "auto",)
+                .unwrap()
+                .id,
+            "preferred"
+        );
+        assert!(resolve_model_from_catalog(&catalog, ProviderKind::OpenaiCodex, "auto").is_err());
+        assert_eq!(
+            resolve_model_from_catalog(&catalog, ProviderKind::OpenaiCodex, "fallback")
+                .unwrap()
+                .id,
+            "fallback"
+        );
     }
 
     #[test]

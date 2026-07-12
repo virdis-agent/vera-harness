@@ -50,7 +50,7 @@ pub struct SessionSettings {
 }
 
 fn default_session_model() -> String {
-    "auto".into()
+    String::new()
 }
 
 impl Default for SessionSettings {
@@ -912,7 +912,7 @@ mod tests {
             .unwrap();
         let resumed = store.open(&session.header.id).unwrap();
         assert_eq!(resumed.settings.effort.as_deref(), Some("high"));
-        assert_eq!(SessionSettings::default().model, "auto");
+        assert!(SessionSettings::default().model.is_empty());
     }
 
     #[test]

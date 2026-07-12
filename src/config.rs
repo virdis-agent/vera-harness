@@ -17,6 +17,7 @@ pub struct Config {
     #[serde(default = "default_config_version")]
     pub version: u32,
     pub provider: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
@@ -62,7 +63,7 @@ impl Default for Config {
         Self {
             version: CURRENT_CONFIG_VERSION,
             provider: "openai-codex".into(),
-            model: "auto".into(),
+            model: String::new(),
             effort: None,
             approval: ApprovalConfig::default(),
             shell_timeout_seconds: 120,
@@ -151,7 +152,14 @@ impl Config {
             self.provider = value.into();
         }
         if let Some(value) = table.get("model").and_then(toml::Value::as_str) {
-            self.model = value.into();
+            // `auto` was the legacy spelling for selecting the provider's
+            // catalog default. Keep old configuration readable without
+            // exposing it as a model option going forward.
+            self.model = if value == "auto" {
+                String::new()
+            } else {
+                value.into()
+            };
         }
         if let Some(value) = table.get("effort").and_then(toml::Value::as_str) {
             self.effort = Some(value.into());
@@ -441,14 +449,16 @@ mod tests {
         fs::create_dir_all(&paths.root).unwrap();
         fs::write(
             paths.root.join("config.toml"),
-            "version = 1\nprovider = \"xai\"\n",
+            "version = 1\nprovider = \"xai\"\nmodel = \"auto\"\n",
         )
         .unwrap();
         let config = Config::load(&paths, &project).unwrap();
         assert_eq!(config.version, CURRENT_CONFIG_VERSION);
+        assert!(config.model.is_empty());
         config.save_global(&paths).unwrap();
         let saved = fs::read_to_string(paths.root.join("config.toml")).unwrap();
         assert!(saved.contains("version = 2"));
+        assert!(!saved.contains("model ="));
     }
 
     #[test]

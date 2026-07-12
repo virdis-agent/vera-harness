@@ -1,7 +1,7 @@
 version = 2
 provider = "openai-codex"
-model = "auto"
-# Optional: auto uses the selected model's catalog default.
+# Optional: omit this to use the selected provider's catalog default.
+# model = "<model-id>"
 # effort = "high"
 shell_timeout_seconds = 120
 context_window_tokens = 128000

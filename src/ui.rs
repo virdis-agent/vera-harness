@@ -136,7 +136,7 @@ pub fn render_dashboard(dashboard: &Dashboard<'_>, state: &UiState) -> Result<Da
     );
     println!(
         "{}",
-        "shift+tab switch mode · ctrl+c twice or ctrl+d exit · /commands for help · /compact context"
+        "shift+tab switch mode · ctrl+c twice to exit · /commands for help · /compact context"
             .with(MUTED)
     );
     println!(
