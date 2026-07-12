@@ -14,7 +14,9 @@ use uuid::Uuid;
 
 use crate::events::{Event, EventSink};
 use crate::paths::VeraPaths;
-use crate::providers::{ModelInfo, Provider, ProviderInput, ProviderRequest, ToolSchema};
+use crate::providers::{
+    CodexRequestMetadata, ModelInfo, Provider, ProviderInput, ProviderRequest, ToolSchema,
+};
 use crate::safety::{
     ApprovalChoice, ApprovalHandler, PathGuard, PermissionKind, PermissionMode, PermissionPolicy,
 };
@@ -511,6 +513,7 @@ impl SubagentRunner for InProcessSubagentRunner {
             }
         );
         let mut input = vec![ProviderInput::message("user", request.task.clone())];
+        let codex_metadata = CodexRequestMetadata::for_session(&session.header.id);
         let mut answer = String::new();
         for _ in 0..MAX_TURNS {
             if request.cancellation.load(Ordering::Relaxed) {
@@ -527,6 +530,7 @@ impl SubagentRunner for InProcessSubagentRunner {
                         instructions: instructions.clone(),
                         effort: None,
                         use_responses_lite: self.use_responses_lite,
+                        codex_metadata: Some(codex_metadata.clone()),
                     },
                     &mut sink,
                 )

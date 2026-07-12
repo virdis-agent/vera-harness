@@ -1279,6 +1279,7 @@ async fn run_headless(
             ),
             effort,
             use_responses_lite: model_info.use_responses_lite,
+            codex_metadata: None,
         },
         AgentRunContext {
             registry: &registry,
@@ -2173,6 +2174,7 @@ async fn run_interactive(
                         .or(config.effort.as_deref()),
                 )?,
                 use_responses_lite: model_info.use_responses_lite,
+                codex_metadata: None,
             },
             AgentRunContext {
                 registry: &registry,
@@ -2508,9 +2510,10 @@ struct AgentTurnResult {
 
 async fn run_agent_turn(
     provider: &dyn Provider,
-    request: ProviderRequest,
+    mut request: ProviderRequest,
     mut context: AgentRunContext<'_>,
 ) -> Result<AgentTurnResult> {
+    request.bind_codex_session(&context.session.header.id);
     context.policy.begin_turn();
     let result = run_agent_turn_inner(provider, request, &mut context).await;
     context.policy.end_turn();
@@ -3016,6 +3019,7 @@ mod tests {
                 instructions: "fixture".into(),
                 effort: None,
                 use_responses_lite: false,
+                codex_metadata: None,
             },
             AgentRunContext {
                 registry: &registry,
@@ -3052,6 +3056,7 @@ mod tests {
                 instructions: "fixture".into(),
                 effort: None,
                 use_responses_lite: false,
+                codex_metadata: None,
             },
             AgentRunContext {
                 registry: &registry,
@@ -3107,6 +3112,7 @@ mod tests {
                 instructions: "fixture".into(),
                 effort: None,
                 use_responses_lite: false,
+                codex_metadata: None,
             },
             AgentRunContext {
                 registry: &registry,

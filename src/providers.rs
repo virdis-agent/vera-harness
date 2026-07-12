@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use reqwest::header::CONTENT_TYPE;
+use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -20,6 +21,61 @@ use crate::paths::{VeraPaths, set_private_file};
 // schema Vera has validated and can safely consume.
 const OPENAI_CODEX_MODEL_CLIENT_VERSION: &str = "0.144.1";
 const OPENAI_CODEX_RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
+
+#[derive(Clone, Debug)]
+pub(crate) struct CodexRequestMetadata {
+    installation_id: String,
+    session_id: String,
+    thread_id: String,
+    turn_id: String,
+    window_id: String,
+    turn_started_at_unix_ms: u64,
+}
+
+impl CodexRequestMetadata {
+    fn new() -> Self {
+        let session_id = Uuid::new_v4().to_string();
+        Self::for_session(&session_id)
+    }
+
+    pub(crate) fn for_session(session_id: &str) -> Self {
+        Self {
+            installation_id: session_id.to_owned(),
+            session_id: session_id.to_owned(),
+            thread_id: session_id.to_owned(),
+            turn_id: Uuid::new_v4().to_string(),
+            window_id: Uuid::new_v4().to_string(),
+            turn_started_at_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+                .unwrap_or_default(),
+        }
+    }
+
+    fn turn_metadata(&self) -> Value {
+        json!({
+            "installation_id": self.installation_id,
+            "session_id": self.session_id,
+            "thread_id": self.thread_id,
+            "turn_id": self.turn_id,
+            "window_id": self.window_id,
+            "request_kind": "turn",
+            "turn_started_at_unix_ms": self.turn_started_at_unix_ms,
+        })
+    }
+
+    fn client_metadata(&self, turn_metadata: &str) -> Value {
+        json!({
+            "x-codex-installation-id": self.installation_id,
+            "session_id": self.session_id,
+            "thread_id": self.thread_id,
+            "turn_id": self.turn_id,
+            "x-codex-window-id": self.window_id,
+            "x-codex-turn-metadata": turn_metadata,
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -207,6 +263,15 @@ pub struct ProviderRequest {
     pub instructions: String,
     pub effort: Option<String>,
     pub use_responses_lite: bool,
+    pub(crate) codex_metadata: Option<CodexRequestMetadata>,
+}
+
+impl ProviderRequest {
+    pub(crate) fn bind_codex_session(&mut self, session_id: &str) {
+        if self.codex_metadata.is_none() {
+            self.codex_metadata = Some(CodexRequestMetadata::for_session(session_id));
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -283,7 +348,11 @@ impl ResponsesProvider {
         builder
     }
 
-    fn body(&self, request: &ProviderRequest) -> Value {
+    fn body_with_metadata(
+        &self,
+        request: &ProviderRequest,
+        metadata: &CodexRequestMetadata,
+    ) -> Value {
         let responses_lite = self.kind == ProviderKind::OpenaiCodex && request.use_responses_lite;
         let input: Vec<Value> = request
             .input
@@ -378,6 +447,7 @@ impl ResponsesProvider {
                 Some(effort) => json!({"effort":effort,"context":"all_turns"}),
                 None => json!({"context":"all_turns"}),
             };
+            self.apply_openai_request_contract(&mut body, metadata, true);
             return body;
         }
         let mut body = json!({
@@ -393,21 +463,68 @@ impl ResponsesProvider {
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
         }
+        self.apply_openai_request_contract(&mut body, metadata, false);
         body
     }
 
+    fn apply_openai_request_contract(
+        &self,
+        body: &mut Value,
+        metadata: &CodexRequestMetadata,
+        responses_lite: bool,
+    ) {
+        if self.kind != ProviderKind::OpenaiCodex {
+            return;
+        }
+        let turn_metadata = metadata.turn_metadata().to_string();
+        body["tool_choice"] = json!("auto");
+        body["include"] = if body.get("reasoning").is_some() {
+            json!(["reasoning.encrypted_content"])
+        } else {
+            json!([])
+        };
+        body["prompt_cache_key"] = json!(metadata.thread_id);
+        body["client_metadata"] = metadata.client_metadata(&turn_metadata);
+        if responses_lite {
+            body["text"] = json!({"verbosity":"low"});
+        }
+    }
+
+    fn body(&self, request: &ProviderRequest) -> Value {
+        let metadata = request
+            .codex_metadata
+            .clone()
+            .unwrap_or_else(CodexRequestMetadata::new);
+        self.body_with_metadata(request, &metadata)
+    }
+
     fn response_request(&self, request: &ProviderRequest) -> reqwest::RequestBuilder {
+        let metadata = request
+            .codex_metadata
+            .clone()
+            .unwrap_or_else(CodexRequestMetadata::new);
+        let turn_metadata = metadata.turn_metadata().to_string();
         let builder = self
             .http
             .post(self.endpoint())
             .header(CONTENT_TYPE, "application/json")
-            .json(&self.body(request));
+            .header(ACCEPT, "text/event-stream")
+            .json(&self.body_with_metadata(request, &metadata));
         let builder = self.add_auth_headers(builder);
-        if self.kind == ProviderKind::OpenaiCodex && request.use_responses_lite {
-            builder.header(OPENAI_CODEX_RESPONSES_LITE_HEADER, "true")
-        } else {
-            builder
+        if self.kind != ProviderKind::OpenaiCodex {
+            return builder;
         }
+        let builder = builder
+            .header("version", OPENAI_CODEX_MODEL_CLIENT_VERSION)
+            .header("x-client-request-id", &metadata.thread_id)
+            .header("session-id", &metadata.session_id)
+            .header("thread-id", &metadata.thread_id)
+            .header("x-codex-window-id", &metadata.window_id)
+            .header("x-codex-turn-metadata", turn_metadata);
+        if request.use_responses_lite {
+            return builder.header(OPENAI_CODEX_RESPONSES_LITE_HEADER, "true");
+        }
+        builder
     }
 
     pub fn supports_image_input(&self) -> bool {
@@ -1007,6 +1124,7 @@ mod tests {
             instructions: "instructions".into(),
             effort: Some("low".into()),
             use_responses_lite: false,
+            codex_metadata: None,
         };
         let body = provider.body(&request);
         assert_eq!(body["store"], false);
@@ -1060,10 +1178,14 @@ mod tests {
             instructions: "instructions".into(),
             effort: None,
             use_responses_lite: false,
+            codex_metadata: None,
         };
 
         let openai = provider(ProviderKind::OpenaiCodex).body(&request);
         assert_eq!(openai["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(openai["tool_choice"], "auto");
+        assert_eq!(openai["include"], json!([]));
+        assert!(openai["client_metadata"].is_object());
         assert_eq!(
             openai["tools"]
                 .as_array()
@@ -1096,6 +1218,8 @@ mod tests {
         );
 
         let xai = provider(ProviderKind::XaiOauth).body(&request);
+        assert!(xai.get("tool_choice").is_none());
+        assert!(xai.get("client_metadata").is_none());
         assert_eq!(xai["tools"].as_array().unwrap().len(), 2);
         assert!(
             xai["tools"]
@@ -1135,7 +1259,7 @@ mod tests {
             },
         )
         .unwrap();
-        let request = ProviderRequest {
+        let mut request = ProviderRequest {
             model: "gpt-5.6-luna".into(),
             input: vec![
                 ProviderInput::message("user", "hello"),
@@ -1162,14 +1286,19 @@ mod tests {
             instructions: "instructions".into(),
             effort: Some("low".into()),
             use_responses_lite: true,
+            codex_metadata: None,
         };
+        request.bind_codex_session("00000000-0000-4000-8000-000000000001");
 
         let body = provider.body(&request);
         assert!(body.get("instructions").is_none());
         assert!(body.get("tools").is_none());
+        assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["parallel_tool_calls"], false);
         assert_eq!(body["reasoning"]["effort"], "low");
         assert_eq!(body["reasoning"]["context"], "all_turns");
+        assert_eq!(body["include"][0], "reasoning.encrypted_content");
+        assert_eq!(body["text"]["verbosity"], "low");
         assert_eq!(body["input"][0]["type"], "additional_tools");
         assert_eq!(body["input"][0]["role"], "developer");
         assert_eq!(body["input"][0]["tools"].as_array().unwrap().len(), 1);
@@ -1190,8 +1319,65 @@ mod tests {
         assert_eq!(body["input"][4]["role"], "user");
         assert_eq!(body["input"][4]["content"][0]["type"], "input_text");
         assert_eq!(body["input"][4]["content"][0]["text"], "continue");
+        let client_metadata = &body["client_metadata"];
+        assert_eq!(
+            client_metadata["session_id"],
+            "00000000-0000-4000-8000-000000000001"
+        );
+        assert_eq!(
+            client_metadata["x-codex-installation-id"],
+            "00000000-0000-4000-8000-000000000001"
+        );
+        assert_eq!(body["prompt_cache_key"], client_metadata["thread_id"]);
+        assert!(
+            !client_metadata["x-codex-installation-id"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
+        let turn_metadata: Value =
+            serde_json::from_str(client_metadata["x-codex-turn-metadata"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(turn_metadata["request_kind"], "turn");
+        assert_eq!(turn_metadata["session_id"], client_metadata["session_id"]);
+        assert_eq!(turn_metadata["thread_id"], client_metadata["thread_id"]);
+        assert_eq!(turn_metadata["turn_id"], client_metadata["turn_id"]);
+        assert_eq!(
+            turn_metadata["window_id"],
+            client_metadata["x-codex-window-id"]
+        );
+        assert!(turn_metadata["turn_started_at_unix_ms"].as_u64().unwrap() > 0);
 
         let built = provider.response_request(&request).build().unwrap();
+        let sent_body: Value =
+            serde_json::from_slice(built.body().and_then(reqwest::Body::as_bytes).unwrap())
+                .unwrap();
+        let sent_metadata = &sent_body["client_metadata"];
+        assert_eq!(built.headers().get(ACCEPT).unwrap(), "text/event-stream");
+        assert_eq!(
+            built.headers().get("version").unwrap(),
+            OPENAI_CODEX_MODEL_CLIENT_VERSION
+        );
+        assert_eq!(
+            built.headers().get("session-id").unwrap(),
+            sent_metadata["session_id"].as_str().unwrap()
+        );
+        assert_eq!(
+            built.headers().get("thread-id").unwrap(),
+            sent_metadata["thread_id"].as_str().unwrap()
+        );
+        assert_eq!(
+            built.headers().get("x-client-request-id").unwrap(),
+            sent_metadata["thread_id"].as_str().unwrap()
+        );
+        assert_eq!(
+            built.headers().get("x-codex-window-id").unwrap(),
+            sent_metadata["x-codex-window-id"].as_str().unwrap()
+        );
+        assert_eq!(
+            built.headers().get("x-codex-turn-metadata").unwrap(),
+            sent_metadata["x-codex-turn-metadata"].as_str().unwrap()
+        );
         assert_eq!(
             built
                 .headers()
@@ -1305,6 +1491,7 @@ mod tests {
             instructions: String::new(),
             effort: None,
             use_responses_lite: false,
+            codex_metadata: None,
         };
         let body = provider.body(&request);
         assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
