@@ -36,7 +36,7 @@ use crate::safety::{
 use crate::sessions::{CapabilitySelection, SessionStore};
 use crate::subagents::InProcessSubagentRunner;
 use crate::tools::{ToolCall, ToolContext, ToolRegistry, execute};
-use crate::ui::{Dashboard, InputAction, read_input, render_dashboard};
+use crate::ui::{Dashboard, InputAction, UiState, read_chat_input, read_input, render_dashboard};
 
 pub async fn run(cli: CommandLine) -> Result<()> {
     let paths = VeraPaths::discover()?;
@@ -566,7 +566,14 @@ fn pick_model(
                     std::io::Write::flush(&mut std::io::stdout())?;
                 }
             },
-            InputAction::Cancel | InputAction::CycleMode | InputAction::Exit => return Ok(None),
+            InputAction::Cancel
+            | InputAction::CycleMode
+            | InputAction::Exit
+            | InputAction::ScrollUp
+            | InputAction::ScrollDown
+            | InputAction::ScrollTop
+            | InputAction::ScrollBottom
+            | InputAction::Resize => return Ok(None),
         }
     }
 }
@@ -607,7 +614,14 @@ fn pick_effort(
                     std::io::Write::flush(&mut std::io::stdout())?;
                 }
             },
-            InputAction::Cancel | InputAction::CycleMode | InputAction::Exit => return Ok(None),
+            InputAction::Cancel
+            | InputAction::CycleMode
+            | InputAction::Exit
+            | InputAction::ScrollUp
+            | InputAction::ScrollDown
+            | InputAction::ScrollTop
+            | InputAction::ScrollBottom
+            | InputAction::Resize => return Ok(None),
         }
     }
 }
@@ -1253,6 +1267,7 @@ async fn run_headless(
             approval: &mut approval,
             session: &mut session,
             output,
+            emit_terminal: true,
             shell_timeout: config.shell_timeout_seconds,
             hooks: &hooks,
             root,
@@ -1390,6 +1405,7 @@ async fn run_interactive(
     )
     .await?;
     let mut ctrl_c_pending = false;
+    let mut ui_state = UiState::default();
     loop {
         let skill_snapshot = skills.lock().await.clone();
         let context = build_context(root, None, &skill_snapshot)?;
@@ -1443,30 +1459,51 @@ async fn run_interactive(
                 .or(config.effort.as_deref()),
         )?
         .unwrap_or_else(|| "provider-controlled".into());
-        let frame = render_dashboard(&Dashboard {
-            version: env!("CARGO_PKG_VERSION"),
-            root: &root_path,
-            instructions: &instructions,
-            skills: &skill_names,
-            prompts: &prompt_catalog.names().cloned().collect::<Vec<_>>(),
-            extensions: &extensions,
-            mcp_servers,
-            mcp_available: available_mcp.len(),
-            provider: &config.provider,
-            model: &config.model,
-            effort: &dashboard_effort,
-            context_tokens: session.context_display().0,
-            context_limit: model_info.context_window,
-            context_estimated: !session.context_display().1,
-            mode: policy.mode(),
-        })?;
-        let line = match read_input(&mut ctrl_c_pending)? {
+        let frame = render_dashboard(
+            &Dashboard {
+                version: env!("CARGO_PKG_VERSION"),
+                root: &root_path,
+                instructions: &instructions,
+                skills: &skill_names,
+                prompts: &prompt_catalog.names().cloned().collect::<Vec<_>>(),
+                extensions: &extensions,
+                mcp_servers,
+                mcp_available: available_mcp.len(),
+                provider: &config.provider,
+                model: &config.model,
+                effort: &dashboard_effort,
+                context_tokens: session.context_display().0,
+                context_limit: model_info.context_window,
+                context_estimated: !session.context_display().1,
+                mode: policy.mode(),
+                messages: &session.messages,
+            },
+            &ui_state,
+        )?;
+        let line = match read_chat_input(&mut ctrl_c_pending, &mut ui_state)? {
             InputAction::CycleMode => {
                 policy.cycle_mode();
                 continue;
             }
             InputAction::Cancel => continue,
             InputAction::Exit => break,
+            InputAction::ScrollUp => {
+                ui_state.scroll_offset = ui_state.scroll_offset.saturating_add(8);
+                continue;
+            }
+            InputAction::ScrollDown => {
+                ui_state.scroll_offset = ui_state.scroll_offset.saturating_sub(8);
+                continue;
+            }
+            InputAction::ScrollTop => {
+                ui_state.scroll_offset = usize::MAX;
+                continue;
+            }
+            InputAction::ScrollBottom => {
+                ui_state.scroll_offset = 0;
+                continue;
+            }
+            InputAction::Resize => continue,
             InputAction::Submit(line) => {
                 frame.finish_input()?;
                 line
@@ -1968,6 +2005,32 @@ async fn run_interactive(
             None
         };
         session.add_message("user", &prompt)?;
+        let mut active_messages = session.messages.clone();
+        active_messages.push(crate::sessions::Message {
+            role: "assistant".into(),
+            content: "…".into(),
+        });
+        render_dashboard(
+            &Dashboard {
+                version: env!("CARGO_PKG_VERSION"),
+                root: &root_path,
+                instructions: &instructions,
+                skills: &skill_names,
+                prompts: &prompt_catalog.names().cloned().collect::<Vec<_>>(),
+                extensions: &extensions,
+                mcp_servers,
+                mcp_available: available_mcp.len(),
+                provider: &config.provider,
+                model: &config.model,
+                effort: &dashboard_effort,
+                context_tokens: session.context_display().0,
+                context_limit: model_info.context_window,
+                context_estimated: !session.context_display().1,
+                mode: policy.mode(),
+                messages: &active_messages,
+            },
+            &ui_state,
+        )?;
         let kind = ProviderKind::parse(&config.provider)?;
         let token = usable_token(&TokenStore::new(paths.clone()), kind)
             .await?
@@ -2067,6 +2130,7 @@ async fn run_interactive(
                 approval: &mut approval,
                 session: &mut session,
                 output: OutputFormat::Text,
+                emit_terminal: false,
                 shell_timeout: config.shell_timeout_seconds,
                 hooks: &hooks,
                 root,
@@ -2327,13 +2391,15 @@ struct PendingToolCall {
 
 struct AgentSink {
     terminal: TerminalEventSink,
+    emit_terminal: bool,
     calls: std::collections::BTreeMap<String, PendingToolCall>,
 }
 
 impl AgentSink {
-    fn new(output: OutputFormat) -> Self {
+    fn new(output: OutputFormat, emit_terminal: bool) -> Self {
         Self {
             terminal: TerminalEventSink::new(output),
+            emit_terminal,
             calls: std::collections::BTreeMap::new(),
         }
     }
@@ -2357,7 +2423,11 @@ impl EventSink for AgentSink {
             }
             call.arguments.push_str(arguments);
         }
-        self.terminal.emit(event).await
+        if self.emit_terminal {
+            self.terminal.emit(event).await
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -2368,6 +2438,7 @@ struct AgentRunContext<'a> {
     approval: &'a mut dyn ApprovalHandler,
     session: &'a mut crate::sessions::Session,
     output: OutputFormat,
+    emit_terminal: bool,
     shell_timeout: u64,
     hooks: &'a [HookSpec],
     root: &'a Path,
@@ -2426,7 +2497,7 @@ async fn run_agent_turn_inner(
         // dashboard can label a full-request local estimate. A later provider
         // usage event replaces it as authoritative.
         context.session.record_estimate(local_estimate)?;
-        let mut sink = AgentSink::new(context.output);
+        let mut sink = AgentSink::new(context.output, context.emit_terminal);
         let result = provider.stream(request.clone(), &mut sink).await?;
         if result.input_tokens > 0 {
             context.session.record_usage(
@@ -2861,6 +2932,7 @@ mod tests {
                 approval: &mut approval,
                 session: &mut session,
                 output: OutputFormat::Jsonl,
+                emit_terminal: true,
                 shell_timeout: 10,
                 hooks: &[],
                 root: &root,
@@ -2895,6 +2967,7 @@ mod tests {
                 approval: &mut approval,
                 session: &mut session,
                 output: OutputFormat::Jsonl,
+                emit_terminal: true,
                 shell_timeout: 10,
                 hooks: &[],
                 root: &root,
@@ -2948,6 +3021,7 @@ mod tests {
                 approval: &mut approval,
                 session: &mut session,
                 output: OutputFormat::Jsonl,
+                emit_terminal: true,
                 shell_timeout: 10,
                 hooks: &[],
                 root: &root,

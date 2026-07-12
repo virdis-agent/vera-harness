@@ -11,6 +11,7 @@ use crossterm::{
 };
 
 use crate::safety::PermissionMode;
+use crate::sessions::Message;
 
 pub struct Dashboard<'a> {
     pub version: &'a str,
@@ -28,6 +29,14 @@ pub struct Dashboard<'a> {
     pub context_limit: usize,
     pub context_estimated: bool,
     pub mode: PermissionMode,
+    pub messages: &'a [Message],
+}
+
+#[derive(Default)]
+pub struct UiState {
+    pub draft: String,
+    /// Number of wrapped transcript lines hidden below the viewport.
+    pub scroll_offset: usize,
 }
 
 const TEAL: Color = Color::Rgb {
@@ -98,11 +107,10 @@ impl DashboardFrame {
     }
 }
 
-pub fn render_dashboard(dashboard: &Dashboard<'_>) -> Result<DashboardFrame> {
+pub fn render_dashboard(dashboard: &Dashboard<'_>, state: &UiState) -> Result<DashboardFrame> {
     let mut stdout = io::stdout();
-    let width = terminal::size()
-        .map(|(width, _)| width as usize)
-        .unwrap_or(100);
+    let (terminal_width, terminal_height) = terminal::size().unwrap_or((100, 40));
+    let width = terminal_width as usize;
     execute!(stdout, Clear(ClearType::All), MoveTo(0, 0))?;
 
     println!(
@@ -129,6 +137,35 @@ pub fn render_dashboard(dashboard: &Dashboard<'_>) -> Result<DashboardFrame> {
     section("Prompts", dashboard.prompts, width);
     section("Extensions", dashboard.extensions, width);
     println!();
+
+    let transcript = transcript_lines(dashboard.messages, width.saturating_sub(2).max(20));
+    if !transcript.is_empty() {
+        let current_row = cursor::position().map(|(_, row)| row).unwrap_or(0);
+        let reserved = 5_u16;
+        let available = terminal_height
+            .saturating_sub(current_row)
+            .saturating_sub(reserved)
+            .max(2) as usize;
+        let max_offset = transcript.len().saturating_sub(available);
+        let end = transcript
+            .len()
+            .saturating_sub(state.scroll_offset.min(max_offset));
+        let start = end.saturating_sub(available);
+        for line in &transcript[start..end] {
+            println!("{line}");
+        }
+        if start > 0 || end < transcript.len() {
+            println!(
+                "{}",
+                format!(
+                    "  history {}/{} · PgUp/PgDn · Home/End",
+                    end,
+                    transcript.len()
+                )
+                .with(MUTED)
+            );
+        }
+    }
     println!(
         "{}",
         format!(
@@ -171,7 +208,7 @@ pub fn render_dashboard(dashboard: &Dashboard<'_>) -> Result<DashboardFrame> {
     } else {
         println!("{line}");
     }
-    print!("{}", "> ".with(mode_color(dashboard.mode)));
+    print!("{}{}", "> ".with(mode_color(dashboard.mode)), state.draft);
     stdout.flush()?;
     let (_, prompt_row) = if interactive {
         cursor::position()?
@@ -230,9 +267,18 @@ pub enum InputAction {
     CycleMode,
     Cancel,
     Exit,
+    ScrollUp,
+    ScrollDown,
+    ScrollTop,
+    ScrollBottom,
+    Resize,
 }
 
 pub fn read_input(ctrl_c_pending: &mut bool) -> Result<InputAction> {
+    read_chat_input(ctrl_c_pending, &mut UiState::default())
+}
+
+pub fn read_chat_input(ctrl_c_pending: &mut bool, state: &mut UiState) -> Result<InputAction> {
     let stdin = io::stdin();
     if !stdin.is_terminal() || !io::stdout().is_terminal() {
         let mut line = String::new();
@@ -245,19 +291,18 @@ pub fn read_input(ctrl_c_pending: &mut bool) -> Result<InputAction> {
     }
 
     terminal::enable_raw_mode()?;
-    let result = read_raw_input(ctrl_c_pending);
+    let result = read_raw_input(ctrl_c_pending, state);
     terminal::disable_raw_mode()?;
     result
 }
 
-fn read_raw_input(ctrl_c_pending: &mut bool) -> Result<InputAction> {
+fn read_raw_input(ctrl_c_pending: &mut bool, state: &mut UiState) -> Result<InputAction> {
     let mut stdout = io::stdout();
-    let mut input = String::new();
     loop {
         match event::read()? {
             Event::Paste(text) => {
                 *ctrl_c_pending = false;
-                input.push_str(&text);
+                state.draft.push_str(&text);
                 print!("{text}");
                 stdout.flush()?;
             }
@@ -277,7 +322,8 @@ fn read_raw_input(ctrl_c_pending: &mut bool) -> Result<InputAction> {
                     KeyCode::Enter => {
                         print!("\r\n");
                         stdout.flush()?;
-                        return Ok(InputAction::Submit(input));
+                        state.scroll_offset = 0;
+                        return Ok(InputAction::Submit(std::mem::take(&mut state.draft)));
                     }
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         print!("^C\r\n");
@@ -290,12 +336,12 @@ fn read_raw_input(ctrl_c_pending: &mut bool) -> Result<InputAction> {
                         return Ok(InputAction::Exit);
                     }
                     KeyCode::Char(character) => {
-                        input.push(character);
+                        state.draft.push(character);
                         print!("{character}");
                         stdout.flush()?;
                     }
                     KeyCode::Backspace => {
-                        if input.pop().is_some() {
+                        if state.draft.pop().is_some() {
                             print!("\x08 \x08");
                             stdout.flush()?;
                         }
@@ -303,12 +349,69 @@ fn read_raw_input(ctrl_c_pending: &mut bool) -> Result<InputAction> {
                     KeyCode::Esc => {
                         return Ok(InputAction::Cancel);
                     }
+                    KeyCode::PageUp => return Ok(InputAction::ScrollUp),
+                    KeyCode::PageDown => return Ok(InputAction::ScrollDown),
+                    KeyCode::Home => return Ok(InputAction::ScrollTop),
+                    KeyCode::End => return Ok(InputAction::ScrollBottom),
                     _ => {}
                 }
             }
+            Event::Resize(_, _) => return Ok(InputAction::Resize),
             _ => {}
         }
     }
+}
+
+fn transcript_lines(messages: &[Message], width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for message in messages {
+        let label = if message.role == "user" {
+            "You"
+        } else {
+            "Vera"
+        };
+        let indent = " ".repeat(label.len() + 2);
+        let content_width = width.saturating_sub(indent.len()).max(10);
+        let mut first = true;
+        for paragraph in message
+            .content
+            .lines()
+            .chain(message.content.is_empty().then_some(""))
+        {
+            let wrapped = wrap_text(paragraph, content_width);
+            for part in wrapped {
+                if first {
+                    lines.push(format!("{label}: {part}"));
+                    first = false;
+                } else {
+                    lines.push(format!("{indent}{part}"));
+                }
+            }
+        }
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if !current.is_empty() && current.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 fn handle_ctrl_c(ctrl_c_pending: &mut bool) -> InputAction {
@@ -357,8 +460,9 @@ fn wrap(entries: &[String], width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputAction, mode_color, wrap};
+    use super::{InputAction, mode_color, transcript_lines, wrap};
     use crate::safety::PermissionMode;
+    use crate::sessions::Message;
 
     #[test]
     fn wraps_context_lists() {
@@ -366,6 +470,24 @@ mod tests {
         let lines = wrap(&entries, 10);
         assert!(lines.len() > 1);
         assert!(lines.iter().all(|line| line.len() <= 10));
+    }
+
+    #[test]
+    fn transcript_labels_and_wraps_conversation_messages() {
+        let messages = vec![
+            Message {
+                role: "user".into(),
+                content: "a message that must wrap".into(),
+            },
+            Message {
+                role: "assistant".into(),
+                content: "visible response".into(),
+            },
+        ];
+        let lines = transcript_lines(&messages, 16);
+        assert!(lines.iter().any(|line| line.starts_with("You: ")));
+        assert!(lines.iter().any(|line| line.starts_with("Vera: ")));
+        assert!(lines.iter().all(|line| line.chars().count() <= 16));
     }
 
     #[test]
