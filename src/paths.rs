@@ -379,6 +379,7 @@ mod tests {
         assert!(!paths.history.exists());
 
         paths.ensure_runtime_dirs().unwrap();
+        crate::extensions::SkillCatalog::load(&paths, temp.path()).unwrap();
         assert_eq!(
             fs::read_to_string(&paths.installation_id).unwrap(),
             installation_id

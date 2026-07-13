@@ -111,6 +111,9 @@ impl SkillCatalog {
         let mut names = std::collections::BTreeSet::new();
         for entry in fs::read_dir(root)? {
             let path = entry?.path();
+            if source == "global" && path.file_name().is_some_and(|name| name == ".system") {
+                continue;
+            }
             if fs::symlink_metadata(&path)?.file_type().is_symlink() {
                 anyhow::bail!("skill entry must not be a symlink: {}", path.display());
             }
