@@ -79,7 +79,10 @@ impl SkillCatalog {
                 catalog.add_root(&root, &format!("plugin:{}", plugin.name), allowed)?;
             }
         }
-        catalog.add_root(&project.join(".vera/skills"), "project", allowed)?;
+        let project_skills = project.join(".vera/skills");
+        if project_skills != paths.skills {
+            catalog.add_root(&project_skills, "project", allowed)?;
+        }
         Ok(catalog)
     }
 
@@ -1365,6 +1368,15 @@ mod tests {
                 .contains("full private body")
         );
         assert!(catalog.loaded_bodies().unwrap().is_empty());
+    }
+
+    #[test]
+    fn home_directory_project_does_not_rescan_global_skills() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = VeraPaths::from_home(temp.path().join("home")).unwrap();
+        paths.ensure_runtime_dirs().unwrap();
+
+        SkillCatalog::load(&paths, &paths.home).unwrap();
     }
 
     #[test]

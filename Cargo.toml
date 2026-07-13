@@ -1,6 +1,6 @@
 [package]
 name = "vera-harness"
-version = "0.1.0-alpha.26"
+version = "0.1.0-alpha.27"
 edition = "2024"
 description = "Vera, a macOS-first coding agent CLI"
 license = "MIT"
