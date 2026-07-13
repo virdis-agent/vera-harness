@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -8,8 +9,35 @@ use url::Url;
 
 use crate::paths::VeraPaths;
 use crate::safety::{PathGuard, PermissionEffect, PermissionPolicy, PermissionRule};
+use crate::settings::{ApprovalOverrides, ConfigOverrides, GlobalState};
 
 pub const CURRENT_CONFIG_VERSION: u32 = 2;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum SettingSource {
+    Defaults,
+    Toml,
+    GlobalState,
+    Project,
+}
+
+impl SettingSource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Defaults => "defaults",
+            Self::Toml => "config.toml",
+            Self::GlobalState => "global state",
+            Self::Project => "project configuration",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ConfigLayers {
+    pub config: Config,
+    pub global_state: GlobalState,
+    pub sources: BTreeMap<String, SettingSource>,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -26,8 +54,8 @@ pub struct Config {
     pub context_window_tokens: usize,
     pub hooks: Vec<String>,
     pub trusted_plugins: Vec<String>,
-    /// Plugins enabled by default for new sessions. Interactive changes do not
-    /// write this list back to disk.
+    /// Plugins enabled by default for new sessions. Interactive changes are
+    /// stored as partial global-state overrides.
     pub enabled_plugins: Vec<String>,
     /// MCP server names enabled by default for new sessions.
     pub enabled_mcp: Vec<String>,
@@ -94,27 +122,109 @@ impl Default for ApprovalConfig {
 
 impl Config {
     pub fn load_global(paths: &VeraPaths) -> Result<Self> {
+        let state = GlobalState::load(paths)?;
+        Self::load_with_state(paths, &paths.root, &state)
+    }
+
+    pub fn load(paths: &VeraPaths, project: &Path) -> Result<Self> {
+        Ok(Self::load_layers(paths, project)?.config)
+    }
+
+    pub fn load_with_state(paths: &VeraPaths, project: &Path, state: &GlobalState) -> Result<Self> {
         let mut config = Self::default();
-        if let Some(global) = read_toml(&paths.root.join("config.toml"))? {
-            config.apply_toml(&global, &paths.root, false)?;
+        if let Some(global) = read_toml(&paths.config_file)? {
+            config
+                .apply_toml(&global, &paths.root, false)
+                .map_err(|error| {
+                    annotate_validation_error(&paths.config_file, "configuration file", error)
+                })?;
         }
-        config.validate()?;
+        config
+            .apply_overrides(&state.config, &paths.root)
+            .map_err(|error| {
+                annotate_validation_error(&paths.global_state, "global state", error)
+            })?;
+        let project_config = project.join(".vera/config.toml");
+        if let Some(local) = read_toml(&project_config)? {
+            config.apply_toml(&local, project, true).map_err(|error| {
+                annotate_validation_error(&project_config, "project configuration file", error)
+            })?;
+        }
+        config.validate().map_err(|error| {
+            anyhow::anyhow!(
+                "validate merged configuration ({} and {}): {error:#}",
+                paths.config_file.display(),
+                paths.global_state.display()
+            )
+        })?;
         config.version = CURRENT_CONFIG_VERSION;
         Ok(config)
     }
 
-    pub fn load(paths: &VeraPaths, project: &Path) -> Result<Self> {
+    pub fn load_layers(paths: &VeraPaths, project: &Path) -> Result<ConfigLayers> {
+        let state = GlobalState::load(paths)?;
+        let global = read_toml(&paths.config_file)?;
+        let project_path = project.join(".vera/config.toml");
+        let local = read_toml(&project_path)?;
         let mut config = Self::default();
-        if let Some(global) = read_toml(&paths.root.join("config.toml"))? {
-            config.apply_toml(&global, &paths.root, false)?;
+        let mut sources = BTreeMap::new();
+        if let Some(value) = &global {
+            config
+                .apply_toml(value, &paths.root, false)
+                .map_err(|error| {
+                    annotate_validation_error(&paths.config_file, "configuration file", error)
+                })?;
+            mark_toml_sources(value, SettingSource::Toml, &mut sources);
         }
-        let project_config = project.join(".vera/config.toml");
-        if let Some(local) = read_toml(&project_config)? {
-            config.apply_toml(&local, project, true)?;
+        config
+            .apply_overrides(&state.config, &paths.root)
+            .map_err(|error| {
+                annotate_validation_error(&paths.global_state, "global state", error)
+            })?;
+        mark_state_sources(&state, &mut sources);
+        if let Some(value) = &local {
+            let before_project = config.clone();
+            let before_sources = sources.clone();
+            config.apply_toml(value, project, true).map_err(|error| {
+                annotate_validation_error(&project_path, "project configuration file", error)
+            })?;
+            mark_toml_sources(value, SettingSource::Project, &mut sources);
+            if let Some(approval) = value.get("approval").and_then(toml::Value::as_table) {
+                if approval.get("auto_read").and_then(toml::Value::as_bool) == Some(true)
+                    && !before_project.approval.auto_read
+                {
+                    restore_source(&mut sources, &before_sources, "approval.auto_read");
+                }
+                for key in ["writes", "shell", "network"] {
+                    if approval.get(key).and_then(toml::Value::as_str) == Some("once")
+                        && match key {
+                            "writes" => before_project.approval.writes == "always",
+                            "shell" => before_project.approval.shell == "always",
+                            "network" => before_project.approval.network == "always",
+                            _ => false,
+                        }
+                    {
+                        restore_source(&mut sources, &before_sources, &format!("approval.{key}"));
+                    }
+                }
+            }
+            if config.permission_rules == before_project.permission_rules {
+                restore_source(&mut sources, &before_sources, "permission_rules");
+            }
         }
-        config.validate()?;
+        config.validate().map_err(|error| {
+            anyhow::anyhow!(
+                "validate merged configuration ({} and {}): {error:#}",
+                paths.config_file.display(),
+                paths.global_state.display()
+            )
+        })?;
         config.version = CURRENT_CONFIG_VERSION;
-        Ok(config)
+        Ok(ConfigLayers {
+            config,
+            global_state: state,
+            sources,
+        })
     }
 
     pub fn save_global(&self, paths: &VeraPaths) -> Result<()> {
@@ -123,7 +233,7 @@ impl Config {
         current.version = CURRENT_CONFIG_VERSION;
         let contents = toml::to_string_pretty(&current)?;
         let guard = PathGuard::new(paths.root.clone())?;
-        let target = guard.resolve(Path::new("config.toml"))?;
+        let target = guard.resolve(&paths.config_file)?;
         let temporary = target.with_file_name(format!(
             ".config.vera-tmp-{}",
             uuid::Uuid::new_v4().simple()
@@ -143,15 +253,42 @@ impl Config {
         let table = value
             .as_table()
             .context("configuration root must be a TOML table")?;
-        if let Some(version) = table.get("version").and_then(toml::Value::as_integer)
-            && (version < 1 || version as u32 > CURRENT_CONFIG_VERSION)
-        {
-            anyhow::bail!("unsupported configuration version {version}");
+        const KEYS: &[&str] = &[
+            "version",
+            "provider",
+            "model",
+            "effort",
+            "approval",
+            "shell_timeout_seconds",
+            "context_window_tokens",
+            "hooks",
+            "trusted_plugins",
+            "enabled_plugins",
+            "enabled_mcp",
+            "allowed_skills",
+            "role",
+            "prompt_roots",
+            "browser_cdp_endpoints",
+            "permission_rules",
+        ];
+        for key in table.keys() {
+            if !KEYS.contains(&key.as_str()) {
+                anyhow::bail!("unknown configuration key {key:?}");
+            }
         }
-        if let Some(value) = table.get("provider").and_then(toml::Value::as_str) {
-            self.provider = value.into();
+        if let Some(version_value) = table.get("version") {
+            let version = version_value
+                .as_integer()
+                .context("configuration version must be an integer")?;
+            if version < 1 || version as u32 > CURRENT_CONFIG_VERSION {
+                anyhow::bail!("unsupported configuration version {version}");
+            }
         }
-        if let Some(value) = table.get("model").and_then(toml::Value::as_str) {
+        if let Some(value) = table.get("provider") {
+            self.provider = value.as_str().context("provider must be a string")?.into();
+        }
+        if let Some(value) = table.get("model") {
+            let value = value.as_str().context("model must be a string")?;
             // `auto` was the legacy spelling for selecting the provider's
             // catalog default. Keep old configuration readable without
             // exposing it as a model option going forward.
@@ -161,20 +298,27 @@ impl Config {
                 value.into()
             };
         }
-        if let Some(value) = table.get("effort").and_then(toml::Value::as_str) {
+        if let Some(value) = table.get("effort") {
+            let value = value.as_str().context("effort must be a string")?;
             self.effort = Some(value.into());
         }
-        if let Some(value) = table
-            .get("shell_timeout_seconds")
-            .and_then(toml::Value::as_integer)
-        {
-            self.shell_timeout_seconds = value.max(1) as u64;
+        if let Some(value) = table.get("shell_timeout_seconds") {
+            let value = value
+                .as_integer()
+                .context("shell_timeout_seconds must be an integer")?;
+            if value <= 0 {
+                anyhow::bail!("shell_timeout_seconds must be greater than zero");
+            }
+            self.shell_timeout_seconds = value as u64;
         }
-        if let Some(value) = table
-            .get("context_window_tokens")
-            .and_then(toml::Value::as_integer)
-        {
-            self.context_window_tokens = value.max(1) as usize;
+        if let Some(value) = table.get("context_window_tokens") {
+            let value = value
+                .as_integer()
+                .context("context_window_tokens must be an integer")?;
+            if value <= 0 {
+                anyhow::bail!("context_window_tokens must be greater than zero");
+            }
+            self.context_window_tokens = value as usize;
         }
         apply_strings(table, "hooks", &mut self.hooks, false)?;
         apply_strings(table, "trusted_plugins", &mut self.trusted_plugins, false)?;
@@ -209,17 +353,31 @@ impl Config {
                 self.permission_rules.extend(parsed);
             }
         }
-        if let Some(role) = table.get("role").and_then(toml::Value::as_str) {
+        if let Some(role) = table.get("role") {
+            let role = role.as_str().context("role must be a string")?;
             self.role = Some(role.into());
         }
 
-        if let Some(approval) = table.get("approval").and_then(toml::Value::as_table) {
+        if let Some(approval_value) = table.get("approval") {
+            let approval = approval_value
+                .as_table()
+                .context("approval must be a TOML table")?;
+            for key in approval.keys() {
+                if !["auto_read", "writes", "shell", "network"].contains(&key.as_str()) {
+                    anyhow::bail!("unknown approval configuration key {key:?}");
+                }
+            }
             if !project {
-                if let Some(value) = approval.get("auto_read").and_then(toml::Value::as_bool) {
-                    self.approval.auto_read = value;
+                if let Some(value) = approval.get("auto_read") {
+                    self.approval.auto_read = value
+                        .as_bool()
+                        .context("approval.auto_read must be a boolean")?;
                 }
                 for key in ["writes", "shell", "network"] {
-                    if let Some(value) = approval.get(key).and_then(toml::Value::as_str) {
+                    if let Some(value) = approval.get(key) {
+                        let value = value
+                            .as_str()
+                            .with_context(|| format!("approval.{key} must be once or always"))?;
                         match key {
                             "writes" => self.approval.writes = value.into(),
                             "shell" => self.approval.shell = value.into(),
@@ -231,11 +389,29 @@ impl Config {
             } else {
                 // Project files may strengthen approval defaults, never weaken
                 // a stricter global default.
-                if approval.get("auto_read").and_then(toml::Value::as_bool) == Some(false) {
+                if approval
+                    .get("auto_read")
+                    .map(|value| {
+                        value
+                            .as_bool()
+                            .context("approval.auto_read must be a boolean")
+                    })
+                    .transpose()?
+                    == Some(false)
+                {
                     self.approval.auto_read = false;
                 }
                 for key in ["writes", "shell", "network"] {
-                    if approval.get(key).and_then(toml::Value::as_str) == Some("always") {
+                    if approval
+                        .get(key)
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .context(format!("approval.{key} must be once or always"))
+                        })
+                        .transpose()?
+                        == Some("always")
+                    {
                         match key {
                             "writes" => self.approval.writes = "always".into(),
                             "shell" => self.approval.shell = "always".into(),
@@ -249,9 +425,68 @@ impl Config {
         Ok(())
     }
 
+    pub fn apply_overrides(&mut self, overrides: &ConfigOverrides, path_base: &Path) -> Result<()> {
+        if let Some(provider) = &overrides.provider {
+            self.provider = provider.clone();
+        }
+        if let Some(model) = &overrides.model {
+            self.model = if model == "auto" {
+                String::new()
+            } else {
+                model.clone()
+            };
+        }
+        if let Some(effort) = &overrides.effort {
+            self.effort = Some(effort.clone());
+        }
+        if let Some(approval) = &overrides.approval {
+            apply_approval_overrides(&mut self.approval, approval)?;
+        }
+        if let Some(value) = overrides.shell_timeout_seconds {
+            self.shell_timeout_seconds = value;
+        }
+        if let Some(value) = overrides.context_window_tokens {
+            self.context_window_tokens = value;
+        }
+        if let Some(values) = &overrides.hooks {
+            self.hooks = values.clone();
+        }
+        if let Some(values) = &overrides.trusted_plugins {
+            self.trusted_plugins = values.clone();
+        }
+        if let Some(values) = &overrides.enabled_plugins {
+            self.enabled_plugins = values.clone();
+        }
+        if let Some(values) = &overrides.enabled_mcp {
+            self.enabled_mcp = values.clone();
+        }
+        if let Some(values) = &overrides.allowed_skills {
+            self.allowed_skills = values.clone();
+        }
+        if let Some(role) = &overrides.role {
+            self.role = Some(role.clone());
+        }
+        if let Some(values) = &overrides.prompt_roots {
+            self.prompt_roots = values.clone();
+        }
+        if let Some(values) = &overrides.browser_cdp_endpoints {
+            self.browser_cdp_endpoints = values.clone();
+        }
+        if let Some(rules) = &overrides.permission_rules {
+            self.permission_rules = rules.clone();
+            for rule in &mut self.permission_rules {
+                normalize_permission_rule(rule, path_base)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.version == 0 || self.version > CURRENT_CONFIG_VERSION {
             anyhow::bail!("unsupported configuration version {}", self.version);
+        }
+        if self.provider.trim().is_empty() {
+            anyhow::bail!("provider must not be empty");
         }
         for (field, values) in [
             ("hooks", &self.hooks),
@@ -280,6 +515,9 @@ impl Config {
         }
         if self.context_window_tokens == 0 {
             anyhow::bail!("context_window_tokens must be greater than zero");
+        }
+        if self.shell_timeout_seconds == 0 {
+            anyhow::bail!("shell_timeout_seconds must be greater than zero");
         }
         for (field, value) in [
             ("approval.writes", self.approval.writes.as_str()),
@@ -331,6 +569,22 @@ impl Config {
         }
         policy
     }
+}
+
+fn restore_source(
+    sources: &mut BTreeMap<String, SettingSource>,
+    before: &BTreeMap<String, SettingSource>,
+    key: &str,
+) {
+    if let Some(source) = before.get(key) {
+        sources.insert(key.to_owned(), *source);
+    } else {
+        sources.remove(key);
+    }
+}
+
+fn annotate_validation_error(path: &Path, kind: &str, error: anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!("validate {kind} {}: {error:#}", path.display())
 }
 
 /// Permission actions carry canonical paths, while configuration is commonly
@@ -404,14 +658,118 @@ fn apply_strings(
     Ok(())
 }
 
-fn read_toml(path: &PathBuf) -> Result<Option<toml::Value>> {
-    if !path.exists() {
-        return Ok(None);
+fn apply_approval_overrides(
+    target: &mut ApprovalConfig,
+    overrides: &ApprovalOverrides,
+) -> Result<()> {
+    if let Some(value) = overrides.auto_read {
+        target.auto_read = value;
+    }
+    if let Some(value) = &overrides.writes {
+        target.writes = value.clone();
+    }
+    if let Some(value) = &overrides.shell {
+        target.shell = value.clone();
+    }
+    if let Some(value) = &overrides.network {
+        target.network = value.clone();
+    }
+    Ok(())
+}
+
+fn mark_toml_sources(
+    value: &toml::Value,
+    source: SettingSource,
+    sources: &mut BTreeMap<String, SettingSource>,
+) {
+    let Some(table) = value.as_table() else {
+        return;
+    };
+    for key in table.keys() {
+        if key == "approval" {
+            if let Some(approval) = table.get(key).and_then(toml::Value::as_table) {
+                for nested in approval.keys() {
+                    sources.insert(format!("approval.{nested}"), source);
+                }
+            }
+        } else {
+            sources.insert(key.clone(), source);
+        }
+    }
+}
+
+fn mark_state_sources(state: &GlobalState, sources: &mut BTreeMap<String, SettingSource>) {
+    let overrides = &state.config;
+    if overrides.provider.is_some() {
+        sources.insert("provider".into(), SettingSource::GlobalState);
+    }
+    if overrides.model.is_some() {
+        sources.insert("model".into(), SettingSource::GlobalState);
+    }
+    if overrides.effort.is_some() {
+        sources.insert("effort".into(), SettingSource::GlobalState);
+    }
+    if let Some(approval) = &overrides.approval {
+        if approval.auto_read.is_some() {
+            sources.insert("approval.auto_read".into(), SettingSource::GlobalState);
+        }
+        if approval.writes.is_some() {
+            sources.insert("approval.writes".into(), SettingSource::GlobalState);
+        }
+        if approval.shell.is_some() {
+            sources.insert("approval.shell".into(), SettingSource::GlobalState);
+        }
+        if approval.network.is_some() {
+            sources.insert("approval.network".into(), SettingSource::GlobalState);
+        }
+    }
+    for key in [
+        (
+            "shell_timeout_seconds",
+            overrides.shell_timeout_seconds.is_some(),
+        ),
+        (
+            "context_window_tokens",
+            overrides.context_window_tokens.is_some(),
+        ),
+        ("hooks", overrides.hooks.is_some()),
+        ("trusted_plugins", overrides.trusted_plugins.is_some()),
+        ("enabled_plugins", overrides.enabled_plugins.is_some()),
+        ("enabled_mcp", overrides.enabled_mcp.is_some()),
+        ("allowed_skills", overrides.allowed_skills.is_some()),
+        ("role", overrides.role.is_some()),
+        ("prompt_roots", overrides.prompt_roots.is_some()),
+        (
+            "browser_cdp_endpoints",
+            overrides.browser_cdp_endpoints.is_some(),
+        ),
+        ("permission_rules", overrides.permission_rules.is_some()),
+        ("display_mode", state.display_mode.is_some()),
+        ("permission_mode", state.permission_mode.is_some()),
+        ("loaded_skills", state.loaded_skills.is_some()),
+    ] {
+        if key.1 {
+            sources.insert(key.0.into(), SettingSource::GlobalState);
+        }
+    }
+}
+
+fn read_toml(path: &Path) -> Result<Option<toml::Value>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        anyhow::bail!(
+            "configuration file {} is not a regular file",
+            path.display()
+        );
     }
     let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    Ok(Some(
-        toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?,
-    ))
+    Ok(Some(toml::from_str(&text).map_err(|error| {
+        anyhow::anyhow!("parse {}: {error}", path.display())
+    })?))
 }
 
 #[cfg(test)]
@@ -438,6 +796,61 @@ mod tests {
         let config = Config::load(&paths, &project).unwrap();
         assert_eq!(config.enabled_plugins, vec!["project"]);
         assert_eq!(config.prompt_roots, vec!["project-prompts"]);
+    }
+
+    #[test]
+    fn global_state_overrides_global_toml_but_project_config_wins() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir_all(project.join(".vera")).unwrap();
+        let paths = VeraPaths::from_home(temp.path().join("home")).unwrap();
+        fs::create_dir_all(&paths.root).unwrap();
+        fs::write(
+            &paths.config_file,
+            "provider = \"global-toml\"\nmodel = \"global-model\"\n",
+        )
+        .unwrap();
+        fs::write(
+            &paths.global_state,
+            r#"{
+  "version": 1,
+  "config": {"provider":"global-state", "model":"state-model"}
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            project.join(".vera/config.toml"),
+            "provider = \"project\"\n",
+        )
+        .unwrap();
+        let layers = Config::load_layers(&paths, &project).unwrap();
+        assert_eq!(layers.config.provider, "project");
+        assert_eq!(layers.config.model, "state-model");
+        assert_eq!(layers.sources["provider"], SettingSource::Project);
+        assert_eq!(layers.sources["model"], SettingSource::GlobalState);
+    }
+
+    #[test]
+    fn malformed_global_state_reports_file_and_json_location() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = VeraPaths::from_home(temp.path().join("home")).unwrap();
+        fs::create_dir_all(&paths.root).unwrap();
+        fs::write(&paths.global_state, "{\n  \"version\": 1,\n").unwrap();
+        let error = Config::load(&paths, temp.path()).unwrap_err().to_string();
+        assert!(error.contains(paths.global_state.to_string_lossy().as_ref()));
+        assert!(error.contains("line"));
+    }
+
+    #[test]
+    fn invalid_toml_type_reports_the_configuration_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = VeraPaths::from_home(temp.path().join("home")).unwrap();
+        fs::create_dir_all(&paths.root).unwrap();
+        fs::write(&paths.config_file, "shell_timeout_seconds = \"slow\"\n").unwrap();
+        let error = Config::load(&paths, temp.path()).unwrap_err().to_string();
+        assert!(error.contains(paths.config_file.to_string_lossy().as_ref()));
+        assert!(error.contains("shell_timeout_seconds"));
     }
 
     #[test]

@@ -67,6 +67,16 @@ pub enum PermissionMode {
 }
 
 impl PermissionMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "plan" => Some(Self::Plan),
+            "confirm" => Some(Self::Confirm),
+            "auto" => Some(Self::Auto),
+            "yolo" => Some(Self::Yolo),
+            _ => None,
+        }
+    }
+
     pub fn next(self) -> Self {
         match self {
             Self::Plan => Self::Confirm,

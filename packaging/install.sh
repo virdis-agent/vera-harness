@@ -4,7 +4,7 @@ set -eu
 # Public install command:
 # curl -fsSL https://raw.githubusercontent.com/virdis-agent/vera-harness/main/packaging/install.sh | sh
 
-VERSION="${VERA_VERSION:-0.1.0-alpha.21}"
+VERSION="${VERA_VERSION:-0.1.0-alpha.25}"
 REPO="${VERA_REPO:-virdis-agent/vera-harness}"
 API_URL="https://api.github.com/repos/${REPO}"
 OS="$(uname -s)"
@@ -78,4 +78,6 @@ install -m 0755 "${TMP_DIR}/vera" "${BIN_DIR}/vera"
 mkdir -p "$HOME/.vera"
 chmod 700 "$HOME/.vera"
 printf '%s\n' "${VERSION}" > "$HOME/.vera/installer-version"
+printf '{\n  "version": "%s"\n}\n' "${VERSION}" > "$HOME/.vera/version.json"
+chmod 600 "$HOME/.vera/installer-version" "$HOME/.vera/version.json"
 echo "Installed vera ${VERSION} to ${BIN_DIR}/vera"

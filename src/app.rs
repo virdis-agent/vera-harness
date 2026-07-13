@@ -23,7 +23,8 @@ use crate::extensions::{
     HookEvent, HookRunner, HookSpec, McpRegistry, PluginManager, PluginManifest, PromptCatalog,
     SkillCatalog, discover_agents,
 };
-use crate::paths::{VeraPaths, repository_root};
+use crate::keybindings::KeyMap;
+use crate::paths::{VeraPaths, repository_root, set_private_file};
 use crate::prompt::{approximate_tokens, build_context};
 use crate::providers::{
     ModelCatalog, ModelInfo, Provider, ProviderInput, ProviderKind, ProviderRequest,
@@ -34,14 +35,15 @@ use crate::safety::{
     PermissionMode, PermissionPolicy, PermissionRule, TerminalApproval,
 };
 use crate::sessions::{CapabilitySelection, DisplayMode, SessionStore};
+use crate::settings::{GlobalState, setting_keys, value_for_key};
 use crate::subagents::InProcessSubagentRunner;
 use crate::tools::{ToolCall, ToolContext, ToolRegistry, execute};
-use crate::ui::{
-    Dashboard, InputAction, Loader, UiState, read_chat_input, read_input, render_dashboard,
-};
+use crate::ui::{Dashboard, InputAction, Loader, UiState, read_input, render_dashboard};
 
 pub async fn run(cli: CommandLine) -> Result<()> {
     let paths = VeraPaths::discover()?;
+    paths.ensure_runtime_dirs()?;
+    let keymap = KeyMap::load(&paths.keybindings)?;
     let root = repository_root(&cli.path)?;
     let config = Config::load(&paths, &root)?;
     match cli.command {
@@ -94,6 +96,7 @@ pub async fn run(cli: CommandLine) -> Result<()> {
                 cli.model,
                 cli.effort,
                 None,
+                &keymap,
             )
             .await?
         }
@@ -108,8 +111,9 @@ async fn run_upgrade(paths: &VeraPaths) -> Result<()> {
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     anyhow::bail!("automatic upgrades currently support Apple Silicon macOS only");
 
-    let marker = paths.root.join("installer-version");
-    if !marker.exists() {
+    let managed_guard = PathGuard::new(paths.root.clone())?;
+    let marker = managed_guard.resolve(&paths.root.join("installer-version"))?;
+    if !marker.is_file() {
         anyhow::bail!(
             "this Vera copy is not installer-managed; use `cargo install --path . --locked` or `brew upgrade vera-harness`"
         );
@@ -175,6 +179,8 @@ async fn run_upgrade(paths: &VeraPaths) -> Result<()> {
     set_executable(&temporary_target)?;
     fs::rename(&temporary_target, &target)?;
     fs::write(&marker, &version)?;
+    set_private_file(&marker)?;
+    paths.record_version(&version)?;
     println!("Updated Vera {current} → {version}.");
     Ok(())
 }
@@ -817,7 +823,8 @@ async fn run_session_resume(paths: &VeraPaths, config: Config, id: String) -> Re
     let session = SessionStore::new(paths.clone()).open(&id)?;
     let root = session.header.root.clone();
     drop(session);
-    run_interactive(paths, &root, config, None, None, None, Some(id)).await
+    let keymap = KeyMap::load(&paths.keybindings)?;
+    run_interactive(paths, &root, config, None, None, None, Some(id), &keymap).await
 }
 
 fn inspect(paths: &VeraPaths, root: &Path, config: &Config) -> Result<()> {
@@ -1012,14 +1019,20 @@ async fn run_mcp(
                     None,
                 )
                 .await?;
-            let mut config = Config::load_global(paths)?;
-            if enabled && !config.enabled_mcp.contains(server) {
-                config.enabled_mcp.push(server.clone());
+            let mut state = GlobalState::load(paths)?;
+            let mut enabled_servers = state
+                .config
+                .enabled_mcp
+                .clone()
+                .unwrap_or_else(|| effective_config.enabled_mcp.clone());
+            if enabled && !enabled_servers.contains(server) {
+                enabled_servers.push(server.clone());
             }
             if !enabled {
-                config.enabled_mcp.retain(|value| value != server);
+                enabled_servers.retain(|value| value != server);
             }
-            config.save_global(paths)?;
+            state.config.enabled_mcp = Some(enabled_servers);
+            state.save(paths, root)?;
             println!(
                 "{} MCP {server}",
                 if enabled { "enabled" } else { "disabled" }
@@ -1162,6 +1175,7 @@ async fn run_headless(
     prompt: &str,
     output: OutputFormat,
 ) -> Result<()> {
+    let global_state = GlobalState::load(paths)?;
     let provider_name = provider_override.unwrap_or(&config.provider);
     let kind = ProviderKind::parse(provider_name)?;
     let store = TokenStore::new(paths.clone());
@@ -1184,6 +1198,12 @@ async fn run_headless(
         &plugins,
         &config.allowed_skills,
     )?));
+    {
+        let mut catalog = skills.lock().await;
+        for name in global_state.loaded_skills.clone().unwrap_or_default() {
+            catalog.load_body(&name)?;
+        }
+    }
     let skill_snapshot = skills.lock().await.clone();
     let context = build_context(root, None, &skill_snapshot)?;
     let mut session = SessionStore::new(paths.clone()).create_with_selection(
@@ -1196,8 +1216,8 @@ async fn run_headless(
             role: config.role.clone(),
             enabled_plugins: config.enabled_plugins.clone(),
             enabled_mcp: config.enabled_mcp.clone(),
-            loaded_skills: Vec::new(),
-            display_mode: DisplayMode::Detailed,
+            loaded_skills: global_state.loaded_skills.clone().unwrap_or_default(),
+            display_mode: global_state.display_mode.unwrap_or(DisplayMode::Detailed),
         },
     )?;
     let hooks = active_hooks(config, &plugins);
@@ -1211,6 +1231,9 @@ async fn run_headless(
     let active_specs = active_mcp_specs(&available_mcp, &config.enabled_mcp);
     let mut mcp_clients = Vec::new();
     let mut policy = config.permission_policy();
+    if let Some(mode) = global_state.permission_mode() {
+        policy.set_mode(mode);
+    }
     policy.restore_session_grants(session.approval_grants());
     let mut approval = TerminalApproval;
     if let Err(error) = refresh_mcp_tools(
@@ -1288,7 +1311,7 @@ async fn run_headless(
             session: &mut session,
             output,
             emit_terminal: true,
-            display_mode: DisplayMode::Detailed,
+            display_mode: global_state.display_mode.unwrap_or(DisplayMode::Detailed),
             shell_timeout: config.shell_timeout_seconds,
             hooks: &hooks,
             root,
@@ -1343,6 +1366,7 @@ async fn run_headless(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_interactive(
     paths: &VeraPaths,
     root: &Path,
@@ -1351,8 +1375,10 @@ async fn run_interactive(
     model_override: Option<String>,
     effort_override: Option<String>,
     resume_id: Option<String>,
+    keymap: &KeyMap,
 ) -> Result<()> {
     let store = SessionStore::new(paths.clone());
+    let mut global_state = GlobalState::load(paths)?;
     let mut resumed = resume_id.as_deref().map(|id| store.open(id)).transpose()?;
     if let Some(session) = resumed.as_ref() {
         config.provider = session.settings.provider.clone();
@@ -1387,8 +1413,8 @@ async fn run_interactive(
                 role: config.role.clone(),
                 enabled_plugins: config.enabled_plugins.clone(),
                 enabled_mcp: config.enabled_mcp.clone(),
-                loaded_skills: Vec::new(),
-                display_mode: DisplayMode::Grouped,
+                loaded_skills: global_state.loaded_skills.clone().unwrap_or_default(),
+                display_mode: global_state.display_mode.unwrap_or_default(),
             },
         )?
     };
@@ -1416,6 +1442,17 @@ async fn run_interactive(
         &plugins,
         &config.allowed_skills,
     )?));
+    {
+        let mut catalog = skills.lock().await;
+        let loaded = if resume_id.is_some() {
+            session.selection.loaded_skills.clone()
+        } else {
+            global_state.loaded_skills.clone().unwrap_or_default()
+        };
+        for name in loaded {
+            catalog.load_body(&name)?;
+        }
+    }
     let guard = PathGuard::new(root.to_path_buf())?;
     let mut registry = ToolRegistry::standard_with_skills(Some(skills.clone()));
     registry
@@ -1423,6 +1460,9 @@ async fn run_interactive(
         .await;
     let mut mcp_clients: Vec<Arc<crate::extensions::McpClient>> = Vec::new();
     let mut policy = config.permission_policy();
+    if let Some(mode) = global_state.permission_mode() {
+        policy.set_mode(mode);
+    }
     policy.restore_session_grants(session.approval_grants());
     let mut approval = TerminalApproval;
     let root_path = root.to_path_buf();
@@ -1500,9 +1540,26 @@ async fn run_interactive(
             },
             &ui_state,
         )?;
-        let line = match read_chat_input(&mut ctrl_c_pending, &mut ui_state)? {
+        let line = match crate::ui::read_chat_input_with_keymap(
+            &mut ctrl_c_pending,
+            &mut ui_state,
+            keymap,
+        )? {
             InputAction::CycleMode => {
+                let previous = policy.mode();
                 policy.cycle_mode();
+                let mut candidate = global_state.clone();
+                candidate.permission_mode = Some(policy.mode().label().to_ascii_lowercase());
+                match persist_global_state(paths, root, &candidate) {
+                    Ok(next_config) => {
+                        global_state = candidate;
+                        config = next_config;
+                    }
+                    Err(error) => {
+                        policy.set_mode(previous);
+                        return Err(error);
+                    }
+                }
                 continue;
             }
             InputAction::Cancel => continue,
@@ -1539,6 +1596,42 @@ async fn run_interactive(
                 print_interactive_help();
                 None
             }
+            "/settings" => {
+                let mut settings_config = Config::load(paths, root)?;
+                settings_command(paths, root, &mut settings_config, &mut global_state, line)?;
+                if line.split_whitespace().nth(2) == Some("display_mode") {
+                    session.set_selection(CapabilitySelection {
+                        display_mode: global_state.display_mode.unwrap_or_default(),
+                        ..session.selection.clone()
+                    })?;
+                }
+                policy = config.permission_policy();
+                if let Some(mode) = global_state.permission_mode() {
+                    policy.set_mode(mode);
+                }
+                policy.restore_session_grants(session.approval_grants());
+                None
+            }
+            command if command.starts_with("/settings ") => {
+                if command.starts_with("/settings get ") {
+                    let mut settings_config = Config::load(paths, root)?;
+                    settings_command(paths, root, &mut settings_config, &mut global_state, line)?;
+                } else {
+                    settings_command(paths, root, &mut config, &mut global_state, line)?;
+                }
+                if line.split_whitespace().nth(2) == Some("display_mode") {
+                    session.set_selection(CapabilitySelection {
+                        display_mode: global_state.display_mode.unwrap_or_default(),
+                        ..session.selection.clone()
+                    })?;
+                }
+                policy = config.permission_policy();
+                if let Some(mode) = global_state.permission_mode() {
+                    policy.set_mode(mode);
+                }
+                policy.restore_session_grants(session.approval_grants());
+                None
+            }
             "/display" => {
                 println!(
                     "tool display: {} (grouped | minimal | detailed)",
@@ -1551,15 +1644,33 @@ async fn run_interactive(
                 let display_mode = DisplayMode::parse(value).with_context(|| {
                     format!("unknown display mode {value:?}; use grouped, minimal, or detailed")
                 })?;
+                let mut candidate = global_state.clone();
+                candidate.display_mode = Some(display_mode);
+                let next_config = persist_global_state(paths, root, &candidate)?;
                 session.set_selection(CapabilitySelection {
                     display_mode,
                     ..session.selection.clone()
                 })?;
+                global_state = candidate;
+                config = next_config;
                 println!("tool display: {}", display_mode.label());
                 None
             }
             "/plan" => {
+                let previous = policy.mode();
                 policy.set_mode(PermissionMode::Plan);
+                let mut candidate = global_state.clone();
+                candidate.permission_mode = Some("plan".into());
+                match persist_global_state(paths, root, &candidate) {
+                    Ok(next_config) => {
+                        global_state = candidate;
+                        config = next_config;
+                    }
+                    Err(error) => {
+                        policy.set_mode(previous);
+                        return Err(error);
+                    }
+                }
                 println!("mode: {}", policy.mode().label());
                 println!(
                     "active plan (revision {}):\n{}",
@@ -1569,17 +1680,56 @@ async fn run_interactive(
                 None
             }
             "/confirm" => {
+                let previous = policy.mode();
                 policy.set_mode(PermissionMode::Confirm);
+                let mut candidate = global_state.clone();
+                candidate.permission_mode = Some("confirm".into());
+                match persist_global_state(paths, root, &candidate) {
+                    Ok(next_config) => {
+                        global_state = candidate;
+                        config = next_config;
+                    }
+                    Err(error) => {
+                        policy.set_mode(previous);
+                        return Err(error);
+                    }
+                }
                 println!("mode: {}", policy.mode().label());
                 None
             }
             "/auto" => {
+                let previous = policy.mode();
                 policy.set_mode(PermissionMode::Auto);
+                let mut candidate = global_state.clone();
+                candidate.permission_mode = Some("auto".into());
+                match persist_global_state(paths, root, &candidate) {
+                    Ok(next_config) => {
+                        global_state = candidate;
+                        config = next_config;
+                    }
+                    Err(error) => {
+                        policy.set_mode(previous);
+                        return Err(error);
+                    }
+                }
                 println!("mode: {}", policy.mode().label());
                 None
             }
             "/yolo" => {
+                let previous = policy.mode();
                 policy.set_mode(PermissionMode::Yolo);
+                let mut candidate = global_state.clone();
+                candidate.permission_mode = Some("yolo".into());
+                match persist_global_state(paths, root, &candidate) {
+                    Ok(next_config) => {
+                        global_state = candidate;
+                        config = next_config;
+                    }
+                    Err(error) => {
+                        policy.set_mode(previous);
+                        return Err(error);
+                    }
+                }
                 println!("mode: {}", policy.mode().label());
                 None
             }
@@ -1605,7 +1755,18 @@ async fn run_interactive(
                                 ..PermissionMatcher::default()
                             },
                         };
+                        let mut candidate = global_state.clone();
+                        let mut rules = candidate
+                            .config
+                            .permission_rules
+                            .clone()
+                            .unwrap_or_else(|| config.permission_rules.clone());
+                        rules.push(rule.clone());
+                        candidate.config.permission_rules = Some(rules);
+                        let next_config = persist_global_state(paths, root, &candidate)?;
                         policy.add_user_rule(rule);
+                        global_state = candidate;
+                        config = next_config;
                         println!("added user permission rule; use /permissions to review");
                     }
                     _ => println!("use /permissions [deny|ask|allow] <kind>"),
@@ -1667,13 +1828,33 @@ async fn run_interactive(
                 let _ = parts.next();
                 match (parts.next(), parts.next()) {
                     (Some("load"), Some(name)) => {
-                        skills.lock().await.load_body(name.trim())?;
-                        session.record_skill_state(name.trim(), true)?;
+                        let name = name.trim();
+                        let mut next_skills = skills.lock().await.clone();
+                        next_skills.load_body(name)?;
+                        let mut candidate = global_state.clone();
+                        let mut loaded = candidate.loaded_skills.clone().unwrap_or_default();
+                        if !loaded.contains(&name.to_owned()) {
+                            loaded.push(name.to_owned());
+                        }
+                        candidate.loaded_skills = Some(loaded);
+                        persist_global_state(paths, root, &candidate)?;
+                        *skills.lock().await = next_skills;
+                        session.record_skill_state(name, true)?;
+                        global_state = candidate;
                         println!("loaded skill {name}");
                     }
                     (Some("unload"), Some(name)) => {
-                        skills.lock().await.unload(name.trim())?;
-                        session.record_skill_state(name.trim(), false)?;
+                        let name = name.trim();
+                        let mut next_skills = skills.lock().await.clone();
+                        next_skills.unload(name)?;
+                        let mut candidate = global_state.clone();
+                        let mut loaded = candidate.loaded_skills.clone().unwrap_or_default();
+                        loaded.retain(|value| value != name);
+                        candidate.loaded_skills = Some(loaded);
+                        persist_global_state(paths, root, &candidate)?;
+                        *skills.lock().await = next_skills;
+                        session.record_skill_state(name, false)?;
+                        global_state = candidate;
                         println!("unloaded skill {name}");
                     }
                     _ => println!("use /skill load|unload <name>"),
@@ -1774,10 +1955,23 @@ async fn run_interactive(
                                 Some(&mut session),
                             )
                             .await?;
+                        let mut candidate = global_state.clone();
+                        let mut enabled = candidate
+                            .config
+                            .enabled_mcp
+                            .clone()
+                            .unwrap_or_else(|| config.enabled_mcp.clone());
+                        if !enabled.contains(&name.to_owned()) {
+                            enabled.push(name.to_owned());
+                        }
+                        candidate.config.enabled_mcp = Some(enabled);
+                        let next_config = persist_global_state(paths, root, &candidate)?;
                         if !active_mcp.contains(&name.to_owned()) {
                             active_mcp.push(name.to_owned());
                         }
                         session.record_mcp_state(name, true)?;
+                        global_state = candidate;
+                        config = next_config;
                         println!("enabled MCP {name}");
                     }
                     (Some("disable"), Some(name)) => {
@@ -1794,6 +1988,15 @@ async fn run_interactive(
                                 Some(&mut session),
                             )
                             .await?;
+                        let mut candidate = global_state.clone();
+                        let mut enabled = candidate
+                            .config
+                            .enabled_mcp
+                            .clone()
+                            .unwrap_or_else(|| config.enabled_mcp.clone());
+                        enabled.retain(|value| value != name);
+                        candidate.config.enabled_mcp = Some(enabled);
+                        let next_config = persist_global_state(paths, root, &candidate)?;
                         active_mcp.retain(|value| value != name);
                         if let Some(client) =
                             mcp_clients.iter().find(|client| client.name() == name)
@@ -1809,6 +2012,8 @@ async fn run_interactive(
                         }
                         registry.remove_tools_starting_with(&format!("mcp__{name}__"));
                         session.record_mcp_state(name, false)?;
+                        global_state = candidate;
+                        config = next_config;
                         println!("disabled MCP {name}");
                     }
                     _ => println!("use /mcp [list] or /mcp enable|disable <name>"),
@@ -1849,6 +2054,17 @@ async fn run_interactive(
                                 Some(&mut session),
                             )
                             .await?;
+                        let mut candidate = global_state.clone();
+                        let mut enabled = candidate
+                            .config
+                            .enabled_plugins
+                            .clone()
+                            .unwrap_or_else(|| config.enabled_plugins.clone());
+                        if !enabled.contains(&name.to_owned()) {
+                            enabled.push(name.to_owned());
+                        }
+                        candidate.config.enabled_plugins = Some(enabled);
+                        let next_config = persist_global_state(paths, root, &candidate)?;
                         if !session_plugins.contains(&name.to_owned()) {
                             session_plugins.push(name.to_owned());
                         }
@@ -1865,6 +2081,8 @@ async fn run_interactive(
                             loaded_skills: skills.lock().await.loaded_names().cloned().collect(),
                             ..session.selection.clone()
                         })?;
+                        global_state = candidate;
+                        config = next_config;
                         println!("enabled extension {name}");
                     }
                     (Some("disable"), Some(name)) => {
@@ -1880,6 +2098,15 @@ async fn run_interactive(
                                 Some(&mut session),
                             )
                             .await?;
+                        let mut candidate = global_state.clone();
+                        let mut enabled = candidate
+                            .config
+                            .enabled_plugins
+                            .clone()
+                            .unwrap_or_else(|| config.enabled_plugins.clone());
+                        enabled.retain(|value| value != name);
+                        candidate.config.enabled_plugins = Some(enabled);
+                        let next_config = persist_global_state(paths, root, &candidate)?;
                         session_plugins.retain(|value| value != name);
                         let disabled_mcp = installed
                             .iter()
@@ -1924,6 +2151,8 @@ async fn run_interactive(
                             loaded_skills: skills.lock().await.loaded_names().cloned().collect(),
                             ..session.selection.clone()
                         })?;
+                        global_state = candidate;
+                        config = next_config;
                         println!("disabled extension {name}");
                     }
                     _ => println!("use /extension enable|disable <name>"),
@@ -1931,9 +2160,16 @@ async fn run_interactive(
                 None
             }
             command if command.starts_with("/provider ") => {
-                let model = select_provider(paths, &mut config, command[10..].trim()).await?;
+                let mut selected = config.clone();
+                let model = select_provider(paths, &mut selected, command[10..].trim()).await?;
+                selected.effort = Some("auto".into());
+                let mut candidate = global_state.clone();
+                candidate.config.provider = Some(selected.provider.clone());
+                candidate.config.model = Some(model.id.clone());
+                candidate.config.effort = selected.effort.clone();
+                let next_config = persist_global_state(paths, root, &candidate)?;
+                config = next_config;
                 model_info = model.clone();
-                config.effort = Some("auto".into());
                 session.set_selection(CapabilitySelection {
                     provider: config.provider.clone(),
                     model: model.id.clone(),
@@ -1941,6 +2177,7 @@ async fn run_interactive(
                     model_context_window: model.context_window,
                     ..session.selection.clone()
                 })?;
+                global_state = candidate;
                 println!("provider: {} (model {})", config.provider, config.model);
                 None
             }
@@ -1954,12 +2191,18 @@ async fn run_interactive(
                 )? {
                     Some(id) => {
                         let model = resolve_model_from_catalog(&catalog, kind, &id)?;
+                        let mut candidate = global_state.clone();
+                        candidate.config.model = Some(model.id.clone());
+                        candidate.config.effort = Some("auto".into());
+                        let next_config = persist_global_state(paths, root, &candidate)?;
                         let effort = apply_model_selection(
                             &mut config,
                             &mut model_info,
                             &mut session,
                             model,
                         )?;
+                        config = next_config;
+                        global_state = candidate;
                         println!("model: {} (effort: {effort})", config.model);
                     }
                     None => println!("model selection cancelled"),
@@ -1983,8 +2226,13 @@ async fn run_interactive(
                     session.selection.effort.as_deref(),
                     &mut ctrl_c_pending,
                 )? {
+                    let mut candidate = global_state.clone();
+                    candidate.config.effort = Some(value.clone());
+                    let next_config = persist_global_state(paths, root, &candidate)?;
                     let effort =
                         apply_effort_selection(&mut config, &model_info, &mut session, &value)?;
+                    config = next_config;
+                    global_state = candidate;
                     println!("effort: {effort}");
                 } else if !model_info.supported_efforts.is_empty() {
                     println!("effort selection cancelled");
@@ -1993,15 +2241,26 @@ async fn run_interactive(
             }
             command if command.starts_with("/effort ") => {
                 let value = command[8..].trim();
+                let mut candidate = global_state.clone();
+                candidate.config.effort = Some(value.to_owned());
+                let next_config = persist_global_state(paths, root, &candidate)?;
                 let effort = apply_effort_selection(&mut config, &model_info, &mut session, value)?;
+                config = next_config;
+                global_state = candidate;
                 println!("effort: {effort}");
                 None
             }
             command if command.starts_with("/model ") => {
                 let kind = ProviderKind::parse(&config.provider)?;
                 let model = resolve_live_model(paths, kind, command[7..].trim()).await?;
+                let mut candidate = global_state.clone();
+                candidate.config.model = Some(model.id.clone());
+                candidate.config.effort = Some("auto".into());
+                let next_config = persist_global_state(paths, root, &candidate)?;
                 let effort =
                     apply_model_selection(&mut config, &mut model_info, &mut session, model)?;
+                config = next_config;
+                global_state = candidate;
                 println!("model: {} (effort: {effort})", config.model);
                 None
             }
@@ -2418,8 +2677,104 @@ fn print_help() {
 
 fn print_interactive_help() {
     println!(
-        "shift+tab cycle modes  /display [grouped|minimal|detailed]  /plan  /confirm  /auto  /yolo  /provider <id>  /models  /model [<id>]  /effort [<level>]  /permissions [deny|ask|allow] <kind>  /processes  /compact  /context  /diff  /undo  /resume <id>  /skills  /skill load|unload <name>  /prompts  /prompt <name> [args]  /extensions  /extension enable|disable <name>  /mcp enable|disable <name>  /agents  /agent <id>  /quit"
+        "shift+tab cycle modes  /settings [get|set|unset]  /display [grouped|minimal|detailed]  /plan  /confirm  /auto  /yolo  /provider <id>  /models  /model [<id>]  /effort [<level>]  /permissions [deny|ask|allow] <kind>  /processes  /compact  /context  /diff  /undo  /resume <id>  /skills  /skill load|unload <name>  /prompts  /prompt <name> [args]  /extensions  /extension enable|disable <name>  /mcp enable|disable <name>  /agents  /agent <id>  /quit"
     );
+}
+
+fn persist_global_state(paths: &VeraPaths, root: &Path, candidate: &GlobalState) -> Result<Config> {
+    let next_config = Config::load_with_state(paths, root, candidate)?;
+    next_config.validate()?;
+    candidate.save(paths, root)?;
+    Ok(next_config)
+}
+
+fn print_settings(
+    paths: &VeraPaths,
+    root: &Path,
+    config: &Config,
+    state: &GlobalState,
+) -> Result<()> {
+    let layers = Config::load_layers(paths, root)?;
+    println!("config.toml\t{}", paths.config_file.display());
+    println!("global_state\t{}", paths.global_state.display());
+    println!("keybindings\t{}\tvalid", paths.keybindings.display());
+    for key in setting_keys() {
+        let value = value_for_key(config, state, key)?;
+        let source = layers
+            .sources
+            .get(*key)
+            .copied()
+            .unwrap_or(crate::config::SettingSource::Defaults);
+        println!("{key}\t{}\t{}", value, source.label());
+    }
+    Ok(())
+}
+
+fn settings_command(
+    paths: &VeraPaths,
+    root: &Path,
+    config: &mut Config,
+    state: &mut GlobalState,
+    command: &str,
+) -> Result<()> {
+    let trimmed = command.trim();
+    if trimmed == "/settings" {
+        print_settings(paths, root, config, state)?;
+        return Ok(());
+    }
+    let rest = trimmed
+        .strip_prefix("/settings ")
+        .context("use /settings [get|set|unset] <key> [value]")?;
+    let mut words = rest.split_whitespace();
+    match words.next() {
+        Some("get") => {
+            let key = words.next().context("/settings get requires a key")?;
+            if words.next().is_some() {
+                anyhow::bail!("/settings get accepts exactly one key");
+            }
+            let value = value_for_key(config, state, key)?;
+            let source = Config::load_layers(paths, root)?
+                .sources
+                .get(key)
+                .copied()
+                .unwrap_or(crate::config::SettingSource::Defaults);
+            println!("{key}\t{}\t{}", value, source.label());
+        }
+        Some("unset") => {
+            let key = words.next().context("/settings unset requires a key")?;
+            if words.next().is_some() {
+                anyhow::bail!("/settings unset accepts exactly one key");
+            }
+            let mut candidate = state.clone();
+            candidate.unset_value(key)?;
+            let next_config = persist_global_state(paths, root, &candidate)?;
+            *state = candidate;
+            *config = next_config;
+            println!("unset {key}");
+        }
+        Some("set") => {
+            let rest = rest
+                .strip_prefix("set")
+                .context("/settings set requires a key and value")?
+                .trim_start();
+            let split_at = rest
+                .find(|character: char| character.is_whitespace())
+                .context("/settings set requires a value")?;
+            let key = &rest[..split_at];
+            let value = rest[split_at..].trim();
+            if value.is_empty() {
+                anyhow::bail!("/settings set requires a value");
+            }
+            let mut candidate = state.clone();
+            candidate.set_value(key, value)?;
+            let next_config = persist_global_state(paths, root, &candidate)?;
+            *state = candidate;
+            *config = next_config;
+            println!("set {key}");
+        }
+        _ => anyhow::bail!("use /settings [get|set|unset] <key> [value]"),
+    }
+    Ok(())
 }
 
 fn print_plan_prompts(objective: &str, draft: &str) {
@@ -2781,6 +3136,37 @@ mod tests {
         assert!(parse_numbered_selection("0", &choices).is_err());
         assert!(parse_numbered_selection("3", &choices).is_err());
         assert!(parse_numbered_selection("unknown", &choices).is_err());
+    }
+
+    #[test]
+    fn settings_commands_persist_overrides_and_unset_falls_back_to_toml() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let paths = VeraPaths::from_home(temp.path().join("home"))?;
+        paths.ensure_runtime_dirs()?;
+        fs::write(&paths.config_file, "shell_timeout_seconds = 30\n")?;
+        let root = temp.path().join("project");
+        fs::create_dir_all(&root)?;
+        let mut config = Config::load(&paths, &root)?;
+        let mut state = GlobalState::load(&paths)?;
+        settings_command(
+            &paths,
+            &root,
+            &mut config,
+            &mut state,
+            "/settings set shell_timeout_seconds 45",
+        )?;
+        assert_eq!(config.shell_timeout_seconds, 45);
+        assert_eq!(state.config.shell_timeout_seconds, Some(45));
+        settings_command(
+            &paths,
+            &root,
+            &mut config,
+            &mut state,
+            "/settings unset shell_timeout_seconds",
+        )?;
+        assert_eq!(config.shell_timeout_seconds, 30);
+        assert!(state.config.shell_timeout_seconds.is_none());
+        Ok(())
     }
 
     #[test]

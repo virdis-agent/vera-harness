@@ -17,6 +17,7 @@ use crossterm::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::keybindings::{Action as KeyAction, KeyMap};
 use crate::safety::PermissionMode;
 use crate::sessions::{DisplayMode, Message};
 
@@ -325,6 +326,15 @@ pub fn read_input(ctrl_c_pending: &mut bool) -> Result<InputAction> {
 }
 
 pub fn read_chat_input(ctrl_c_pending: &mut bool, state: &mut UiState) -> Result<InputAction> {
+    let keymap = KeyMap::built_in();
+    read_chat_input_with_keymap(ctrl_c_pending, state, &keymap)
+}
+
+pub fn read_chat_input_with_keymap(
+    ctrl_c_pending: &mut bool,
+    state: &mut UiState,
+    keymap: &KeyMap,
+) -> Result<InputAction> {
     let stdin = io::stdin();
     if !stdin.is_terminal() || !io::stdout().is_terminal() {
         let mut line = String::new();
@@ -341,7 +351,7 @@ pub fn read_chat_input(ctrl_c_pending: &mut bool, state: &mut UiState) -> Result
         terminal::disable_raw_mode()?;
         return Err(error.into());
     }
-    let result = read_raw_input(ctrl_c_pending, state);
+    let result = read_raw_input(ctrl_c_pending, state, keymap);
     let paste_disable = execute!(io::stdout(), DisableBracketedPaste);
     let raw_disable = terminal::disable_raw_mode();
     match (result, paste_disable, raw_disable) {
@@ -352,7 +362,11 @@ pub fn read_chat_input(ctrl_c_pending: &mut bool, state: &mut UiState) -> Result
     }
 }
 
-fn read_raw_input(ctrl_c_pending: &mut bool, state: &mut UiState) -> Result<InputAction> {
+fn read_raw_input(
+    ctrl_c_pending: &mut bool,
+    state: &mut UiState,
+    keymap: &KeyMap,
+) -> Result<InputAction> {
     let mut stdout = io::stdout();
     state.cursor_index = state.cursor_index.min(state.draft.chars().count());
     let prompt_row = cursor::position()?.1;
@@ -369,92 +383,61 @@ fn read_raw_input(ctrl_c_pending: &mut bool, state: &mut UiState) -> Result<Inpu
                 if !is_ctrl_c {
                     *ctrl_c_pending = false;
                 }
-                match key.code {
-                    KeyCode::BackTab => {
-                        return Ok(InputAction::CycleMode);
-                    }
-                    KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        return Ok(InputAction::CycleMode);
-                    }
-                    KeyCode::Enter => {
-                        state.scroll_offset = 0;
-                        let submitted = std::mem::take(&mut state.draft);
-                        if !submitted.trim().is_empty() && state.history.last() != Some(&submitted)
-                        {
-                            state.history.push(submitted.clone());
+                if !is_ctrl_c && let Some(action) = keymap.action_for(key) {
+                    match action {
+                        KeyAction::CycleMode => return Ok(InputAction::CycleMode),
+                        KeyAction::Submit => {
+                            state.scroll_offset = 0;
+                            let submitted = std::mem::take(&mut state.draft);
+                            if !submitted.trim().is_empty()
+                                && state.history.last() != Some(&submitted)
+                            {
+                                state.history.push(submitted.clone());
+                            }
+                            state.cursor_index = 0;
+                            state.history_index = None;
+                            state.history_draft.clear();
+                            return Ok(InputAction::Submit(submitted));
                         }
-                        state.cursor_index = 0;
-                        state.history_index = None;
-                        state.history_draft.clear();
-                        return Ok(InputAction::Submit(submitted));
-                    }
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(handle_ctrl_c(ctrl_c_pending));
-                    }
-                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        if state.draft.is_empty() {
-                            return Ok(InputAction::Exit);
+                        KeyAction::Cancel => return Ok(InputAction::Cancel),
+                        KeyAction::DeleteForward => {
+                            if state.draft.is_empty() {
+                                return Ok(InputAction::Exit);
+                            }
+                            delete_at_cursor(state);
                         }
-                        delete_at_cursor(state);
-                        redraw_draft(&mut stdout, prompt_row, state)?;
+                        KeyAction::DeleteBackward => delete_before_cursor(state, false),
+                        KeyAction::DeleteLine => delete_before_cursor(state, true),
+                        KeyAction::DeleteWord => delete_word_before_cursor(state),
+                        KeyAction::CursorLeft => {
+                            state.cursor_index = state.cursor_index.saturating_sub(1)
+                        }
+                        KeyAction::CursorRight => {
+                            state.cursor_index =
+                                (state.cursor_index + 1).min(state.draft.chars().count())
+                        }
+                        KeyAction::CursorHome => state.cursor_index = 0,
+                        KeyAction::CursorEnd => state.cursor_index = state.draft.chars().count(),
+                        KeyAction::HistoryPrevious => history_up(state),
+                        KeyAction::HistoryNext => history_down(state),
+                        KeyAction::ScrollUp => return Ok(InputAction::ScrollUp),
+                        KeyAction::ScrollDown => return Ok(InputAction::ScrollDown),
+                        KeyAction::ScrollTop => return Ok(InputAction::ScrollTop),
+                        KeyAction::ScrollBottom => return Ok(InputAction::ScrollBottom),
                     }
-                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        delete_before_cursor(state, true);
-                        redraw_draft(&mut stdout, prompt_row, state)?;
-                    }
-                    KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        delete_word_before_cursor(state);
-                        redraw_draft(&mut stdout, prompt_row, state)?;
-                    }
-                    KeyCode::Char(character) => {
-                        insert_at_cursor(state, &character.to_string());
-                        redraw_draft(&mut stdout, prompt_row, state)?;
-                    }
-                    KeyCode::Backspace => {
-                        delete_before_cursor(state, false);
-                        redraw_draft(&mut stdout, prompt_row, state)?;
-                    }
-                    KeyCode::Delete => {
-                        delete_at_cursor(state);
-                        redraw_draft(&mut stdout, prompt_row, state)?;
-                    }
-                    KeyCode::Left => {
-                        state.cursor_index = state.cursor_index.saturating_sub(1);
-                        redraw_draft(&mut stdout, prompt_row, state)?;
-                    }
-                    KeyCode::Right => {
-                        state.cursor_index =
-                            (state.cursor_index + 1).min(state.draft.chars().count());
-                        redraw_draft(&mut stdout, prompt_row, state)?;
-                    }
-                    KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(InputAction::ScrollTop);
-                    }
-                    KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(InputAction::ScrollBottom);
-                    }
-                    KeyCode::Home => {
-                        state.cursor_index = 0;
-                        redraw_draft(&mut stdout, prompt_row, state)?;
-                    }
-                    KeyCode::End => {
-                        state.cursor_index = state.draft.chars().count();
-                        redraw_draft(&mut stdout, prompt_row, state)?;
-                    }
-                    KeyCode::Up => {
-                        history_up(state);
-                        redraw_draft(&mut stdout, prompt_row, state)?;
-                    }
-                    KeyCode::Down => {
-                        history_down(state);
-                        redraw_draft(&mut stdout, prompt_row, state)?;
-                    }
-                    KeyCode::Esc => {
-                        return Ok(InputAction::Cancel);
-                    }
-                    KeyCode::PageUp => return Ok(InputAction::ScrollUp),
-                    KeyCode::PageDown => return Ok(InputAction::ScrollDown),
-                    _ => {}
+                    redraw_draft(&mut stdout, prompt_row, state)?;
+                    continue;
+                }
+                if is_ctrl_c {
+                    return Ok(handle_ctrl_c(ctrl_c_pending));
+                }
+                if let KeyCode::Char(character) = key.code
+                    && key.modifiers.intersection(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) == KeyModifiers::NONE
+                {
+                    insert_at_cursor(state, &character.to_string());
+                    redraw_draft(&mut stdout, prompt_row, state)?;
                 }
             }
             Event::Resize(_, _) => return Ok(InputAction::Resize),
