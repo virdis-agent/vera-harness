@@ -289,11 +289,18 @@ impl ResponsesProvider {
             .input
             .iter()
             .map(|item| match item {
-                ProviderInput::Message { role, content } if responses_lite => json!({
-                    "type": "message",
-                    "role": role,
-                    "content": [{"type":"input_text","text":content}]
-                }),
+                ProviderInput::Message { role, content } if responses_lite => {
+                    let content_type = if role == "assistant" {
+                        "output_text"
+                    } else {
+                        "input_text"
+                    };
+                    json!({
+                        "type": "message",
+                        "role": role,
+                        "content": [{"type":content_type,"text":content}]
+                    })
+                }
                 ProviderInput::Message { role, content } => json!({"role":role,"content":content}),
                 ProviderInput::ImageMessage {
                     role,
@@ -1130,7 +1137,11 @@ mod tests {
         .unwrap();
         let request = ProviderRequest {
             model: "gpt-5.6-luna".into(),
-            input: vec![ProviderInput::message("user", "hello")],
+            input: vec![
+                ProviderInput::message("user", "hello"),
+                ProviderInput::message("assistant", "hi"),
+                ProviderInput::message("user", "continue"),
+            ],
             tools: vec![
                 ToolSchema {
                     name: "web_search".into(),
@@ -1169,7 +1180,16 @@ mod tests {
         assert_eq!(body["input"][1]["content"][0]["text"], "instructions");
         assert_eq!(body["input"][2]["type"], "message");
         assert_eq!(body["input"][2]["role"], "user");
+        assert_eq!(body["input"][2]["content"][0]["type"], "input_text");
         assert_eq!(body["input"][2]["content"][0]["text"], "hello");
+        assert_eq!(body["input"][3]["type"], "message");
+        assert_eq!(body["input"][3]["role"], "assistant");
+        assert_eq!(body["input"][3]["content"][0]["type"], "output_text");
+        assert_eq!(body["input"][3]["content"][0]["text"], "hi");
+        assert_eq!(body["input"][4]["type"], "message");
+        assert_eq!(body["input"][4]["role"], "user");
+        assert_eq!(body["input"][4]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][4]["content"][0]["text"], "continue");
 
         let built = provider.response_request(&request).build().unwrap();
         assert_eq!(
